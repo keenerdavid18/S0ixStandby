@@ -279,6 +279,13 @@ private:
 	// -s0ixeclog (diagnostic): at the active action, if the EC GPE woke us, drain the pending EC queries (QR_EC),
 	// replay them from a thread and keep a rolling log of what each Deep Idle wake was ("EC wake log").
 	bool ecLog {false}, elPending {false};
+	// -s0ixacnoec: on AC the EC sends a battery event (_Q24) every ~56 s and powerd lingers 45 s in each dark wake.
+	// While on AC, point LID's acpi-wake-gpe at its dead legacy pin (0x17) for the sleep so AppleACPIPlatform does not
+	// arm the EC GPE; restore at wake. On battery nothing changes (lid-open wake via the EC).
+	bool acNoEc {false}, acNoEcActive {false};
+	OSObject *acNoEcSaved {nullptr};
+	uint32_t acNoEcCount {0};
+	void acNoEcApply();
 	uint8_t elQ[8] {}, elN {0}, elSci {0};
 	uint16_t elPm1 {0};
 	bool elEc {false};

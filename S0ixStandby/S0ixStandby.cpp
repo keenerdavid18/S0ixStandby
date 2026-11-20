@@ -443,6 +443,7 @@ bool S0ixStandby::start(IOService *provider)
 	kbWake = bootArg("-s0ixkbdwake");
 	edWake = bootArg("-s0ixecdrain");
 	ecLog = bootArg("-s0ixeclog");
+	acNoEc = bootArg("-s0ixacnoec");
 	iomNoDpof = bootArg("-s0ixnodpof");
 	tcssD3 = bootArg("-s0ixtcssd3");
 	lwPad = bootArg("-s0ixlidpad");
@@ -2186,10 +2187,26 @@ void S0ixStandby::updateAC()
 	onAC = ac;
 }
 
+// -s0ixacnoec: keep LID's wake GPE in step with the power source (registry writes only here, never in the sleep path).
+void S0ixStandby::acNoEcApply()
+{
+	if (!acNoEc || !lwDev[0]) return;
+	if (!acNoEcSaved) acNoEcSaved = lwDev[0]->copyProperty("acpi-wake-gpe");   // the boot value (EC GPE via SSDT)
+	if (!acNoEcSaved) return;
+	if (onAC && !acNoEcActive) {
+		if (OSNumber *n = OSNumber::withNumber(0x17, 32)) { lwDev[0]->setProperty("acpi-wake-gpe", n); n->release(); }
+		acNoEcActive = true;
+	} else if (!onAC && acNoEcActive) {
+		lwDev[0]->setProperty("acpi-wake-gpe", acNoEcSaved);
+		acNoEcActive = false;
+	}
+}
+
 void S0ixStandby::acTimerFired(OSObject *owner, IOTimerEventSource *sender)
 {
 	if (S0ixStandby *self = OSDynamicCast(S0ixStandby, owner)) {
 		self->updateAC();
+		self->acNoEcApply();
 		sender->setTimeoutMS(10000);
 	}
 }
@@ -2275,6 +2292,12 @@ void S0ixStandby::battTimerFired(OSObject *owner, IOTimerEventSource *sender)
 		}
 		if (self->gpuMMIO) gDispMMIO = self->gpuMMIO;
 		self->publishTypeC();
+		if (self->acNoEc) {
+			char t[120];
+			snprintf(t, sizeof(t), "on (-s0ixacnoec): %u sleeps on AC with the EC wake disarmed; now %s, LID wake GPE %s", self->acNoEcCount,
+			         self->onAC ? "on AC" : "on battery", self->acNoEcActive ? "0x17 (EC off)" : "boot value (EC)");
+			self->setProperty("EC wake on AC", t);
+		}
 		self->nvmePrep();
 		self->publishLog();
 		sender->setTimeoutMS(60000);
@@ -2305,6 +2328,7 @@ void S0ixStandby::onSleep()
 	// Drivers (and IOPCIFamily's D3 transition) are done by now.
 	wifiPmcsrSleep = wifiDev ? wifiDev->configRead16(wifiPmCap + 4) : 0xFFFF;
 
+	if (acNoEc && acNoEcActive && lastSleepType == kSleepTypeDeepIdle) acNoEcCount++;
 	if (lwWake && lastSleepType == kSleepTypeDeepIdle) lidPsw(true);   // while the EC still answers normally
 	if (tcssD3 && lastSleepType == kSleepTypeDeepIdle) tcssSleep();   // before the LPS0 entry _DSM, like Linux
 	if (nobmMask && lastSleepType == kSleepTypeDeepIdle) nobmSleep();
