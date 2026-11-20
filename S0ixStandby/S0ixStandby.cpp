@@ -1072,6 +1072,13 @@ IOReturn S0ixStandby::callPlatformFunction(const OSSymbol *functionName, bool wa
 				}
 				if (gpe0StsPort && ecGpe != 0xFFFFFFFF)                // clear the EC GPE status so a new SCI edge can wake us
 					outl((uint16_t)(gpe0StsPort + (ecGpe / 32) * 4), 1u << (ecGpe % 32));
+				pm1CntAtHalt = pm1CntPort ? inw(pm1CntPort) : 0;
+				sciUnmasked = false;
+				if (ioapic) {                                          // SCI = GSI 9 (MADT override: level, active high)
+					ioapic[0] = 0x22; sciRteLow = ioapic[4];
+					ioapic[0] = 0x23; sciRteHigh = ioapic[4];
+					if (sciRteLow & 0x10000) { ioapic[0] = 0x22; ioapic[4] = sciRteLow & ~0x10000u; sciUnmasked = true; }
+				}
 			}
 			if (ecArm) {
 				// Last thing before the halt: macOS has set up its wake GPEs.
@@ -1106,7 +1113,11 @@ IOReturn S0ixStandby::callPlatformFunction(const OSSymbol *functionName, bool wa
 			if (gpe0StsPort) {
 				// What woke the CPU: status bits are still set here (cleared later by ACPI).
 				pm1StsAtWake = pm1StsPort ? inw(pm1StsPort) : 0;
-				if (edWake) ecStsAtWakeP = inb(0x66);
+				if (edWake) {
+					ecStsAtWakeP = inb(0x66);
+					ecEnAtWake = (gpe0EnPort && ecGpe != 0xFFFFFFFF) ? inl((uint16_t)(gpe0EnPort + (ecGpe / 32) * 4)) : 0;
+					if (sciUnmasked && ioapic) { ioapic[0] = 0x22; ioapic[4] = sciRteLow; sciUnmasked = false; }
+				}
 				if (pbArmed) {
 					outw(pbEnPort, (uint16_t)(inw(pbEnPort) & ~kPm1PwrBtn));   // never leave it on: nobody handles it awake
 					if (pm1StsAtWake & kPm1PwrBtn) { outw(pm1StsPort, kPm1PwrBtn); pbWoke = true; }
@@ -1206,6 +1217,7 @@ void S0ixStandby::setupWakeInfo()
 	if (len >= 232 && f[220] == 1 && OSReadLittleInt64(f, 224))   // X_GPE0_BLK, SystemIO
 		gpe = OSReadLittleInt64(f, 224);
 	if (pm1 && pm1 < 0xFFFF) pm1StsPort = (uint16_t)pm1;
+	{ uint32_t cnt = OSReadLittleInt32(f, 64); if (cnt && cnt < 0xFFFF) pm1CntPort = (uint16_t)cnt; }   // PM1a_CNT_BLK
 	{
 		uint8_t evtLen = f[88];                                   // PM1_EVT_LEN
 		if (pm1StsPort && evtLen >= 4 && pm1 + evtLen / 2 < 0xFFFF) pbEnPort = (uint16_t)(pm1 + evtLen / 2);
@@ -1268,7 +1280,7 @@ void S0ixStandby::setupLidWake()
 {
 	setProperty("Keyboard wake", kbWake ? "armed during Deep Idle when the lid is open (-s0ixkbdwake): i8042 keyboard port + IRQ1"
 	                                    : "off (boot-arg -s0ixkbdwake)");
-	if (kbWake && !ioapic) {
+	if ((kbWake || edWake) && !ioapic) {
 		// MADT on this machine: one I/O APIC at 0xFEC00000, no source override for IRQ1 (GSI 1).
 		if (IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(0xFEC00000ULL, 0x1000, kIODirectionInOut)) {
 			ioapicMap = md->map(kIOMapInhibitCache);
@@ -1703,10 +1715,11 @@ void S0ixStandby::onWake()
 	if (wakeInfoValid && ecGpe != 0xFFFFFFFF && (gpe0StsAtWake[ecGpe / 8] >> (ecGpe % 8) & 1))
 		ecWakeCount++;
 	if (edWake && lastSleepType == kSleepTypeDeepIdle) {
-		char ed[160]; int n = snprintf(ed, sizeof(ed), "EC status at halt 0x%02x (GPE sts %d), drained %u:", ecStsAtHalt,
+		char ed[300]; int n = snprintf(ed, sizeof(ed), "EC status at halt 0x%02x (GPE sts %d), drained %u:", ecStsAtHalt,
 		                               (int)edGpeStsAtHalt, edN);
 		for (uint8_t i = 0; i < edN && n < (int)sizeof(ed) - 6; i++) n += snprintf(ed + n, sizeof(ed) - (size_t)n, " _Q%02X", edQ[i]);
-		snprintf(ed + n, sizeof(ed) - (size_t)n, "; EC status at wake 0x%02x", ecStsAtWakeP);
+		snprintf(ed + n, sizeof(ed) - (size_t)n, "; EC status at wake 0x%02x, EC GPE dword at wake 0x%08x; PM1_CNT 0x%04x; SCI RTE 0x%08x:%08x%s",
+		         ecStsAtWakeP, ecEnAtWake, pm1CntAtHalt, sciRteHigh, sciRteLow, ioapic ? "" : " (no IOAPIC map)");
 		setProperty("EC drain at last sleep", ed);
 		if (edN && ecDev && edCall) {
 			uint64_t dl; clock_interval_to_deadline(500, kMillisecondScale, &dl);

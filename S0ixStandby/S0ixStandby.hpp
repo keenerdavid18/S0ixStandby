@@ -270,6 +270,9 @@ private:
 	IOACPIPlatformDevice *ecDev {nullptr};
 	uint8_t edQ[8] {}, edN {0}, ecStsAtHalt {0}, ecStsAtWakeP {0};
 	bool edGpeStsAtHalt {false};
+	uint32_t sciRteLow {0}, sciRteHigh {0}, ecEnAtWake {0};
+	uint16_t pm1CntAtHalt {0}, pm1CntPort {0};
+	bool sciUnmasked {false};
 	thread_call_t edCall {nullptr};
 	static void edReplay(thread_call_param_t self, thread_call_param_t);
 	void setupLidWake();
