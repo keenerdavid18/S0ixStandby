@@ -260,6 +260,11 @@ private:
 	volatile uint32_t *ioapic {nullptr};
 	uint32_t kbRteLow {0}, kbRteHigh {0};
 	bool kbRteUnmasked {false};
+	// GPE 0x00-0x5F are GPIO-routed on this PCH: the enable bit lives in the GPIO community (GPI_GPE_EN).
+	IOMemoryMap *lwGpioMap {nullptr};
+	volatile uint32_t *lwGpeSts {nullptr}, *lwGpeEn {nullptr};
+	uint32_t lwGpioBit {0}, lwGpeEnSaved {0}, lwGpeStsAtWake {0};
+	bool lwGpioArmed {false};
 	void setupLidWake();
 	void lidPsw(bool on);
 	thread_call_t pbCall {nullptr};

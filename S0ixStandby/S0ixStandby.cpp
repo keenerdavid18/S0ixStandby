@@ -1033,6 +1033,14 @@ IOReturn S0ixStandby::callPlatformFunction(const OSSymbol *functionName, bool wa
 				}
 			}
 			if (lwArm && lwGpe != 0xFFFFFFFF) lwEnReadback = gpeEnSet(gpe0EnPort, lwGpe);
+			lwGpioArmed = false;
+			if (lwArm && lwGpeEn) {
+				lwGpeEnSaved = *lwGpeEn;
+				*lwGpeSts = lwGpioBit;                             // clear a stale status (write 1)
+				*lwGpeEn = lwGpeEnSaved | lwGpioBit;
+				lwEnReadback = *lwGpeEn;
+				lwGpioArmed = true;
+			}
 			if (pbArm) {
 				// The laptop reports its power button through the EC (FADT control-method button), so the OS
 				// never enables the PCH's fixed PWRBTN event; the EC is in standby and does not deliver the
@@ -1083,6 +1091,12 @@ IOReturn S0ixStandby::callPlatformFunction(const OSSymbol *functionName, bool wa
 					gpe0StsAtWake[i] = inb((uint16_t)(gpe0StsPort + i));
 				wakeInfoValid = true;
 				if (lwArm && lwGpe != 0xFFFFFFFF && (gpe0StsAtWake[lwGpe / 8] >> (lwGpe % 8) & 1)) lwWoke = true;
+				if (lwGpioArmed) {
+					lwGpeStsAtWake = *lwGpeSts;
+					if (lwGpeStsAtWake & lwGpioBit) lwWoke = true;
+					*lwGpeEn = lwGpeEnSaved;                          // restore; ACPI clears the status when it handles _L17
+					lwGpioArmed = false;
+				}
 				if (kbArm) {
 					kbStsAtWake = inb(0x64);
 					if (kbRteUnmasked && ioapic) { ioapic[0] = 0x12; ioapic[4] = kbRteLow; kbRteUnmasked = false; }
@@ -1267,6 +1281,56 @@ void S0ixStandby::setupLidWake()
 		hid->release();
 	}
 	if (lwGpe != 0xFFFFFFFF && (!gpe0EnPort || lwGpe / 8 >= gpe0Half)) lwGpe = 0xFFFFFFFF;
+	// GPIO-routed GPE (DW0..DW2 = GPEs 0x00-0x5F): find its group/pad from the BIOS GNVS (GEI0-2 group, GED0-2 dword)
+	// and the GPIO community's GPI_GPE_STS / GPI_GPE_EN through the DSDT's own helper \_SB.GADR(group, 5).
+	if (lwGpe != 0xFFFFFFFF && lwGpe < 0x60 && lwDev[0]) {
+		static const char *gei[3] = { "\\GEI0", "\\GEI1", "\\GEI2" };
+		static const char *ged[3] = { "\\GED0", "\\GED1", "\\GED2" };
+		UInt32 grp = 0, dw = 0;
+		uint32_t blk = lwGpe / 32;
+		char gb[160] = "";
+		if (lwDev[0]->evaluateInteger(gei[blk], &grp) == kIOReturnSuccess &&
+		    lwDev[0]->evaluateInteger(ged[blk], &dw) == kIOReturnSuccess) {
+			OSObject *args[2] = { OSNumber::withNumber(grp, 32), OSNumber::withNumber(5, 32) };
+			OSObject *res = nullptr;
+			uint64_t sts = 0;
+			if (args[0] && args[1] && lwDev[0]->evaluateObject("\\_SB.GADR", &res, args, 2) == kIOReturnSuccess && res)
+				if (OSNumber *n = OSDynamicCast(OSNumber, res)) sts = n->unsigned64BitValue() + (uint64_t)dw * 4;
+			OSSafeReleaseNULL(res);
+			OSSafeReleaseNULL(args[0]); OSSafeReleaseNULL(args[1]);
+			uint32_t pad = dw * 32 + lwGpe % 32;
+			uint32_t padcfg = 0xFFFFFFFF, own = 0xFFFFFFFF;
+			OSObject *pa = OSNumber::withNumber(((uint64_t)grp << 16) | pad, 32);
+			if (pa) {
+				OSObject *r2 = nullptr;
+				if (lwDev[0]->evaluateObject("\\_SB.GPC0", &r2, &pa, 1) == kIOReturnSuccess && r2)
+					if (OSNumber *n = OSDynamicCast(OSNumber, r2)) padcfg = n->unsigned32BitValue();
+				OSSafeReleaseNULL(r2);
+				if (lwDev[0]->evaluateObject("\\_SB.GHPO", &r2, &pa, 1) == kIOReturnSuccess && r2)
+					if (OSNumber *n = OSDynamicCast(OSNumber, r2)) own = n->unsigned32BitValue();
+				OSSafeReleaseNULL(r2);
+				pa->release();
+			}
+			if (sts && (sts & 3) == 0 && ((sts + 0x20) & ~0xFFFULL) == (sts & ~0xFFFULL)) {
+				if (IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(sts & ~0xFFFULL, 0x1000, kIODirectionInOut)) {
+					lwGpioMap = md->map(kIOMapInhibitCache);
+					md->release();
+					if (lwGpioMap) {
+						uint8_t *base = reinterpret_cast<uint8_t *>(lwGpioMap->getVirtualAddress()) + (sts & 0xFFF);
+						lwGpeSts = reinterpret_cast<volatile uint32_t *>(base);
+						lwGpeEn = reinterpret_cast<volatile uint32_t *>(base + 0x20);
+						lwGpioBit = 1u << (lwGpe % 32);
+					}
+				}
+			}
+			snprintf(gb, sizeof(gb), "GPE 0x%x = GPIO group %u pad %u, GPI_GPE_STS 0x%llx (EN +0x20)%s, PADCFG0 0x%08x, HOSTSW_OWN %u",
+			         lwGpe, (unsigned)grp, pad, (unsigned long long)sts, lwGpeEn ? "" : " NOT MAPPED", padcfg, own);
+		} else {
+			snprintf(gb, sizeof(gb), "GPE 0x%x: GEI/GED not readable", lwGpe);
+		}
+		setProperty("Lid wake GPIO", gb);
+		LOG("Lid wake GPIO %s", gb);
+	}
 	char buf[128];
 	snprintf(buf, sizeof(buf), "%s: lid %s, sleep button %s, wake GPE 0x%x",
 	         lwWake ? "armed during Deep Idle (-s0ixlidwake)" : "off (boot-arg -s0ixlidwake)",
@@ -1358,8 +1422,9 @@ void S0ixStandby::publishWakeInfo()
 		for (uint32_t i = 0; i < gpe0Half && i < sizeof(gpe0EnAtHalt); i++)
 			k += snprintf(en + k, sizeof(en) - k, "%02x", gpe0EnAtHalt[i]);
 		setProperty("GPE0_EN at last halt (byte 0 first)", en);
-		char rb[96];
-		snprintf(rb, sizeof(rb), "lid GPE dword 0x%08x, EC GPE dword 0x%08x (after arming, 32-bit I/O)", lwEnReadback, ecEnReadback);
+		char rb[140];
+		snprintf(rb, sizeof(rb), "lid GPE enable 0x%08x (GPIO GPI_GPE_EN when mapped), status at wake 0x%08x, EC GPE dword 0x%08x",
+		         lwEnReadback, lwGpeStsAtWake, ecEnReadback);
 		setProperty("GPE0_EN readback at last halt", rb);
 	}
 	if (ecGpe != 0xFFFFFFFF) {
