@@ -334,6 +334,10 @@ private:
 	char nvPsInfo[kNvMax][140] {};
 	bool nvmeCtrlPs(uint32_t i);
 	void nvmePrep();
+	bool prepAlloc {true};
+	uint32_t nvMode {0};
+	uint8_t nvMsix[kNvMax] {};
+	uint16_t nvMsixSaved[kNvMax] {};
 	void nvmeCtrlReset(uint32_t i);
 	uint64_t smiLast {0}, smiTscLast {0};
 	static void iomLater(thread_call_param_t self, thread_call_param_t);

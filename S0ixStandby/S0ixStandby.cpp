@@ -314,12 +314,20 @@ static int dispHandler(struct sysctl_oid *, void *arg1, int, struct sysctl_req *
 	IOLockUnlock(gCoreSnapLock);
 	return err;
 }
+// NVMe handling for the next Deep Idle, switchable at runtime: sudo sysctl debug.s0ix.nvme=<v>
+//   v & 0xF: 0 = macOS default (drives in D3), 1 = D0 with the controller left shut down, 2 = D0 + live controller in
+//   its deepest PS (I/O queue pair); 0x10 = mask MSI-X (function mask) during the halt (mode 2);
+//   0x100 / 0x200 = live PS only for the drive on bus 4 / bus 5 (the other stays D0 shut down; neither = both).
+//   Default from -s0ixnvmed0 / -s0ixnvmeps.
+static int gNvmeCtl = 0;
 SYSCTL_DECL(_debug);
 SYSCTL_NODE(_debug, OID_AUTO, s0ix, CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, "S0ixStandby");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, cores, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
             coreSnapHandler, "S", "per-CPU TSC + core C3/C6/C7 + Atom module C6 residency");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, pmc, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
             pmcPageHandler, "S", "live PMC page (the LPIT counter's 4 KB MMIO page)");
+SYSCTL_INT(_debug_s0ix, OID_AUTO, nvme, CTLFLAG_RW | CTLFLAG_LOCKED, &gNvmeCtl, 0,
+           "NVMe Deep Idle mode: 0 D3 (macOS), 1 D0 shut down, 2 D0 live PS; +0x10 MSI-X masked; +0x100 bus 4 / +0x200 bus 5 only");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, disp, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
             dispHandler, "S", "live display registers");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, disphalt, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, (void *)1, 0,
@@ -438,6 +446,7 @@ bool S0ixStandby::start(IOService *provider)
 	tcssD3 = bootArg("-s0ixtcssd3");
 	nvmeD0 = bootArg("-s0ixnvmed0");
 	nvmePs = nvmeD0 && bootArg("-s0ixnvmeps");
+	gNvmeCtl = nvmePs ? 2 : nvmeD0 ? 1 : 0;
 	{ uint32_t m = 0; if (PE_parse_boot_argn("s0ixnobm", &m, sizeof(m))) nobmMask = m; }
 	uint32_t fn = 0;
 	if (PE_parse_boot_argn("s0ixfn", &fn, sizeof(fn)))
@@ -592,6 +601,7 @@ bool S0ixStandby::start(IOService *provider)
 		sysctl_register_oid(&sysctl__debug_s0ix);
 		sysctl_register_oid(&sysctl__debug_s0ix_cores);
 		sysctl_register_oid(&sysctl__debug_s0ix_pmc);
+		sysctl_register_oid(&sysctl__debug_s0ix_nvme);
 		sysctl_register_oid(&sysctl__debug_s0ix_disp);
 		sysctl_register_oid(&sysctl__debug_s0ix_disphalt);
 		gPmcPage = counterPage;
@@ -607,6 +617,7 @@ void S0ixStandby::stop(IOService *provider)
 		gDispMMIO = nullptr;
 		sysctl_unregister_oid(&sysctl__debug_s0ix_disphalt);
 		sysctl_unregister_oid(&sysctl__debug_s0ix_disp);
+		sysctl_unregister_oid(&sysctl__debug_s0ix_nvme);
 		sysctl_unregister_oid(&sysctl__debug_s0ix_pmc);
 		sysctl_unregister_oid(&sysctl__debug_s0ix_cores);
 		sysctl_unregister_oid(&sysctl__debug_s0ix);
@@ -1520,7 +1531,7 @@ void S0ixStandby::iomLater(thread_call_param_t self, thread_call_param_t)
 	}
 	if (me->nvN) {
 		char t[300]; size_t n = 0;
-		n += snprintf(t + n, sizeof(t) - n, "%s, %u sleeps:", me->nvmeD0 ? "-s0ixnvmed0 on" : "observe only", me->nvCount);
+		n += snprintf(t + n, sizeof(t) - n, "mode 0x%x (%s), %u sleeps:", me->nvMode, (me->nvMode & 0xF) == 2 ? "D0 live PS" : (me->nvMode & 0xF) == 1 ? "D0 shut down" : "macOS D3", me->nvCount);
 		for (uint32_t i = 0; i < me->nvN && n < sizeof(t) - 40; i++)
 			n += snprintf(t + n, sizeof(t) - n, " %02x:%02x.%x D%u%s", me->nvDev[i]->getBusNumber(), me->nvDev[i]->getDeviceNumber(),
 			              me->nvDev[i]->getFunctionNumber(), me->nvSaved[i] & 3, me->nvChanged[i] ? (me->nvAfter[i] & 3) == 0 ? "->D0" : "->D0 FAILED" : "");
@@ -1532,7 +1543,7 @@ void S0ixStandby::iomLater(thread_call_param_t self, thread_call_param_t)
 			              me->nvLnk[i][0], me->nvLnk[i][1], me->nvLnk[i][2], me->nvDc2[i][0], me->nvDc2[i][1], me->nvDc2[i][2],
 			              me->nvSs1[i][0], me->nvSs1[i][1], me->nvSs1[i][2], me->nvLtrV[i][0], me->nvLtrV[i][1], me->nvLtrV[i][2]);
 		me->setProperty("NVMe link config (saved/after D0/restored)", l);
-		if (me->nvmePs) {
+		if ((me->nvMode & 0xF) == 2) {
 			char q[400]; size_t k = 0;
 			for (uint32_t i = 0; i < me->nvN && k < sizeof(q) - 100; i++)
 				if (me->nvPsInfo[i][0]) k += snprintf(q + k, sizeof(q) - k, "%s%02x:00.0 %s", k ? "; " : "", me->nvDev[i]->getBusNumber(), me->nvPsInfo[i]);
@@ -1588,7 +1599,7 @@ void S0ixStandby::nvmePrep()
 			o = 0; if (nvDev[i]->extendedFindPCICapability(kIOPCIExpressCapabilityIDLatencyTolerenceReporting, &o)) nvLtr[i] = (uint16_t)o;
 		}
 	}
-	if (!nvmePs) return;
+	if (!prepAlloc) return;
 	for (uint32_t i = 0; i < nvN; i++) {
 		if ((nvDev[i]->configRead32(kIOPCIConfigRevisionID) >> 8) != 0x010802) continue;
 		if (!nvBuf[i]) {
@@ -1603,7 +1614,8 @@ void S0ixStandby::nvmePrep()
 
 void S0ixStandby::nvmeSleep()
 {
-	if (!nvN) { const bool ps = nvmePs; nvmePs = false; nvmePrep(); nvmePs = ps; }   // lookup only: no allocation here
+	if (!nvN) { prepAlloc = false; nvmePrep(); prepAlloc = true; }   // lookup only: no allocation here
+	nvMode = (uint32_t)gNvmeCtl;
 	for (uint32_t i = 0; i < nvN; i++) {
 		nvChanged[i] = false;
 		nvSaved[i] = nvPm[i] ? nvDev[i]->configRead16(nvPm[i] + 4) : 0;
@@ -1617,7 +1629,10 @@ void S0ixStandby::nvmeSleep()
 		snap(0);
 		if (nvL1ss[i]) nvSs2[i] = d->configRead32(nvL1ss[i] + 0xC);
 		snap(1); snap(2);
-		if (nvmeD0 && nvPm[i] && (nvSaved[i] & 3) && nvSaved[i] != 0xFFFF) {
+		const bool isEp = (d->configRead32(kIOPCIConfigRevisionID) >> 8) == 0x010802;
+		const uint32_t sel = nvMode & 0x300, bus = d->getBusNumber();
+		const bool picked = !isEp || !sel || (bus == 4 && (sel & 0x100)) || (bus == 5 && (sel & 0x200));
+		if ((nvMode & 0xF) >= 1 && nvPm[i] && (nvSaved[i] & 3) && nvSaved[i] != 0xFFFF) {   // D0: every drive
 			d->configWrite16(nvPm[i] + 4, (uint16_t)(nvSaved[i] & ~3));
 			IODelay(10000);                                   // D3hot -> D0: 10 ms
 			nvAfter[i] = d->configRead16(nvPm[i] + 4);
@@ -1636,7 +1651,16 @@ void S0ixStandby::nvmeSleep()
 			snap(2);
 		}
 		nvCtrlUp[i] = false; nvPsInfo[i][0] = 0;
-		if (nvmePs && nvChanged[i] && (d->configRead32(kIOPCIConfigRevisionID) >> 8) == 0x010802) nvCtrlUp[i] = nvmeCtrlPs(i);
+		if ((nvMode & 0xF) == 2 && nvChanged[i] && isEp && picked) {                           // live PS: picked drives
+			nvCtrlUp[i] = nvmeCtrlPs(i);
+			if (nvCtrlUp[i] && (nvMode & 0x10)) {                   // MSI-X function mask for the halt
+				uint8_t mx = 0;
+				if (d->findPCICapability(kIOPCIMSIXCapability, &mx) && mx) {
+					nvMsixSaved[i] = d->configRead16(mx + 2); nvMsix[i] = mx;
+					d->configWrite16(mx + 2, (uint16_t)(nvMsixSaved[i] | 0x4000));
+				}
+			}
+		}
 	}
 }
 
@@ -1729,6 +1753,7 @@ void S0ixStandby::nvmeWake()
 	if (!nvN) return;
 	for (int i = (int)nvN - 1; i >= 0; i--)                   // endpoints first, then the root ports
 		if (nvChanged[i]) {
+			if (nvMsix[i]) { nvDev[i]->configWrite16(nvMsix[i] + 2, nvMsixSaved[i]); nvMsix[i] = 0; }
 			if (nvCtrlUp[i]) { nvmeCtrlReset(i); nvCtrlUp[i] = false; }
 			uint16_t v = nvDev[i]->configRead16(nvPm[i] + 4);
 			if (v != 0xFFFF) nvDev[i]->configWrite16(nvPm[i] + 4, (uint16_t)((v & ~3) | (nvSaved[i] & 3)));
@@ -2150,7 +2175,7 @@ void S0ixStandby::battTimerFired(OSObject *owner, IOTimerEventSource *sender)
 		}
 		if (self->gpuMMIO) gDispMMIO = self->gpuMMIO;
 		self->publishTypeC();
-		if (self->nvmePs) self->nvmePrep();
+		self->nvmePrep();
 		self->publishLog();
 		sender->setTimeoutMS(60000);
 	}
