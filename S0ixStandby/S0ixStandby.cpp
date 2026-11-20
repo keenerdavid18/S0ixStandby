@@ -436,6 +436,7 @@ bool S0ixStandby::start(IOService *provider)
 	edWake = bootArg("-s0ixecdrain");
 	iomNoDpof = bootArg("-s0ixnodpof");
 	tcssD3 = bootArg("-s0ixtcssd3");
+	{ uint32_t m = 0; if (PE_parse_boot_argn("s0ixnobm", &m, sizeof(m))) nobmMask = m; }
 	uint32_t fn = 0;
 	if (PE_parse_boot_argn("s0ixfn", &fn, sizeof(fn)))
 		fnAllow = fn;
@@ -1515,6 +1516,12 @@ void S0ixStandby::iomLater(thread_call_param_t self, thread_call_param_t)
 		me->setProperty("GT RC6 at last halt", g);
 		gRc6Valid = false; gRc6TscHalt = 0;
 	}
+	if (me->nobmMask) {
+		char t[200];
+		snprintf(t, sizeof(t), "mask 0x%x: %u of %u devices had bus mastering cleared at the last sleep, %u sleeps",
+		         me->nobmMask, me->nobmDone, me->nobmN, me->nobmCount);
+		me->setProperty("Bus master off at last sleep", t);
+	}
 	if (me->tcssD3) {
 		char t[260];
 		snprintf(t, sizeof(t), "%u sleeps; xHCI 0d.0 PMCSR at sleep 0x%04x (restored to 0x%04x); TCOF 0x%x%s: IOM 0x%08x -> 0x%08x "
@@ -1530,6 +1537,50 @@ void S0ixStandby::iomLater(thread_call_param_t self, thread_call_param_t)
 // TD3C bit when no TCSS device asks to skip D3cold, _ON (TCON) clears it and waits for TACK. macOS never does ACPI
 // runtime D3 for these devices, so TD3C stayed 0 in every Deep Idle and the package never left PC2 once the IOM was
 // told the display is off (DPOF or DC9). Only with nothing attached to USB-C (never sleep docked).
+void S0ixStandby::nobmSleep()
+{
+	static const struct { uint32_t bit; uint8_t dev, fn; } kList[] = {
+		{1, 0x14, 3}, {2, 0x1f, 6}, {4, 0x1f, 3}, {8, 0x14, 0}, {0x10, 0x15, 0}, {0x10, 0x15, 2}, {0x20, 0x0d, 0}, {0x40, 0x07, 0},
+	};
+	nobmDone = 0;
+	if (!nobmN) {   // resolve once
+		OSDictionary *match = serviceMatching("IOPCIDevice");
+		OSIterator *it = match ? getMatchingServices(match) : nullptr;
+		OSSafeReleaseNULL(match);
+		if (!it) return;
+		while (OSObject *o = it->getNextObject()) {
+			IOPCIDevice *d = OSDynamicCast(IOPCIDevice, o);
+			if (!d || d->getBusNumber() != 0) continue;
+			for (auto &w : kList)
+				if ((nobmMask & w.bit) && d->getDeviceNumber() == w.dev && d->getFunctionNumber() == w.fn && nobmN < kNoBmMax) {
+					d->retain(); nobmDev[nobmN++] = d;
+				}
+		}
+		it->release();
+	}
+	for (uint32_t i = 0; i < nobmN; i++) {
+		nobmCmd[i] = nobmDev[i]->configRead16(kIOPCIConfigCommand);
+		if (nobmCmd[i] != 0xFFFF && (nobmCmd[i] & kIOPCICommandBusMaster)) {
+			nobmDev[i]->configWrite16(kIOPCIConfigCommand, (uint16_t)(nobmCmd[i] & ~kIOPCICommandBusMaster));
+			nobmDone++;
+		} else {
+			nobmCmd[i] = 0;   // nothing to restore
+		}
+	}
+}
+
+void S0ixStandby::nobmWake()
+{
+	if (!nobmMask) return;
+	for (uint32_t i = 0; i < nobmN; i++)
+		if (nobmCmd[i]) {
+			uint16_t v = nobmDev[i]->configRead16(kIOPCIConfigCommand);
+			if (v != 0xFFFF) nobmDev[i]->configWrite16(kIOPCIConfigCommand, (uint16_t)(v | kIOPCICommandBusMaster));
+			nobmCmd[i] = 0;
+		}
+	nobmCount++;
+}
+
 void S0ixStandby::tcssSleep()
 {
 	tcssOff = false;
@@ -1930,6 +1981,7 @@ void S0ixStandby::onSleep()
 
 	if (lwWake && lastSleepType == kSleepTypeDeepIdle) lidPsw(true);   // while the EC still answers normally
 	if (tcssD3 && lastSleepType == kSleepTypeDeepIdle) tcssSleep();   // before the LPS0 entry _DSM, like Linux
+	if (nobmMask && lastSleepType == kSleepTypeDeepIdle) nobmSleep();
 	entered = false;
 	if (dsmEnabled && lastSleepType == kSleepTypeDeepIdle &&
 	    (dsmMask[kIntel] || dsmMask[kMicrosoft] || dsmMask[kAMD])) {
@@ -2080,6 +2132,7 @@ void S0ixStandby::onWake()
 		}
 		entered = false;
 	}
+	nobmWake();
 	tcssWake();
 	if (lwWake && lastSleepType == kSleepTypeDeepIdle) lidPsw(false);
 	// Before any driver wakes: Apple's accelerator restarts the engines later.

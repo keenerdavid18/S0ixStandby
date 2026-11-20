@@ -296,6 +296,16 @@ private:
 	IOReturn tcssRet[2] {};
 	void tcssSleep();
 	void tcssWake();
+	// s0ixnobm=<mask>: clear PCI Bus Master Enable for the Deep Idle (sleep action -> wake action) on PCH bus masters
+	// whose macOS drivers may leave DMA running: 1 CNVi 00:14.3, 2 GbE 00:1f.6, 4 HDA 00:1f.3, 8 PCH xHCI 00:14.0,
+	// 0x10 LPSS I2C 00:15.0/15.2, 0x20 TCSS xHCI 00:0d.0, 0x40 TBT RP 00:07.0
+	uint32_t nobmMask {0};
+	static constexpr int kNoBmMax = 8;
+	IOPCIDevice *nobmDev[kNoBmMax] {};
+	uint16_t nobmCmd[kNoBmMax] {};
+	uint32_t nobmN {0}, nobmDone {0}, nobmCount {0};
+	void nobmSleep();
+	void nobmWake();
 	uint64_t smiLast {0}, smiTscLast {0};
 	static void iomLater(thread_call_param_t self, thread_call_param_t);
 	void setupLidWake();
