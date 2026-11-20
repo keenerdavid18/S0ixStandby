@@ -1278,6 +1278,47 @@ static uint8_t kbcArm(uint8_t &before, uint8_t &after)
 
 // Lid (PNP0C0D) and sleep button (PNP0C0E): on ThinkPads their _PSW sets the EC's wake-on-lid-open / wake-on-Fn bits
 // and _PRW names the EC's wake GPE. macOS does not do this for Deep Idle, so the lid never wakes the machine.
+void S0ixStandby::publishTypeC()
+{
+	static const uint8_t devs[][2] = { {0x0d, 0}, {0x0d, 2}, {0x0d, 3}, {0x07, 0}, {0x07, 1}, {0x07, 2}, {0x07, 3} };
+	char pci[200]; size_t n = 0;
+	char ports[400]; size_t pn = 0;
+	ports[0] = 0;
+	OSDictionary *match = serviceMatching("IOPCIDevice");
+	OSIterator *it = match ? getMatchingServices(match) : nullptr;
+	OSSafeReleaseNULL(match);
+	if (!it) return;
+	while (OSObject *o = it->getNextObject()) {
+		IOPCIDevice *d = OSDynamicCast(IOPCIDevice, o);
+		if (!d || d->getBusNumber() != 0) continue;
+		for (auto &w : devs) {
+			if (d->getDeviceNumber() != w[0] || d->getFunctionNumber() != w[1]) continue;
+			uint8_t pm = 0;
+			uint32_t ps = 0xFF;
+			if (d->findPCICapability(kIOPCIPowerManagementCapability, &pm) && pm) ps = d->configRead16(pm + 4) & 3;
+			n += snprintf(pci + n, sizeof(pci) - n, "%s%x.%x D%u", n ? ", " : "", w[0], w[1], ps);
+			if (w[0] == 0x0d && w[1] == 0) {
+				if (!txhcMap) txhcMap = d->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0, kIOMapInhibitCache);
+				if (txhcMap && ps == 0) {
+					volatile uint8_t *b = reinterpret_cast<volatile uint8_t *>(txhcMap->getVirtualAddress());
+					uint32_t capLen = b[0], maxPorts = (*reinterpret_cast<volatile uint32_t *>(b + 4)) >> 24;
+					for (uint32_t p = 0; p < maxPorts && p < 16; p++) {
+						uint32_t sc = *reinterpret_cast<volatile uint32_t *>(b + capLen + 0x400 + 0x10 * p);
+						// CCS b0, PED b1, PR b4, PLS b8:5, PP b9, speed b13:10
+						pn += snprintf(ports + pn, sizeof(ports) - pn, "%sP%u %08x(ccs%u ped%u pls%u pp%u spd%u)", pn ? " " : "",
+						               p + 1, sc, sc & 1, (sc >> 1) & 1, (sc >> 5) & 0xF, (sc >> 9) & 1, (sc >> 10) & 0xF);
+					}
+				} else if (ps != 0) {
+					snprintf(ports, sizeof(ports), "controller not in D0");
+				}
+			}
+		}
+	}
+	it->release();
+	setProperty("Type-C PCI", pci);
+	setProperty("TXHC PORTSC", ports);
+}
+
 void S0ixStandby::setupIom()
 {
 	char buf[128] = "not found";
@@ -1322,6 +1363,7 @@ void S0ixStandby::iomLater(thread_call_param_t self, thread_call_param_t)
 	snprintf(b, sizeof(b), "before entry 0x%08x, after entry 0x%08x, wake before exit 0x%08x, after exit 0x%08x, +2 s 0x%08x",
 	         me->iomV[0], me->iomV[1], me->iomV[2], me->iomV[3], me->iomV[4]);
 	me->setProperty("Type-C IOM at last sleep", b);
+	me->publishTypeC();
 }
 
 void S0ixStandby::setupLidWake()
@@ -1649,6 +1691,7 @@ void S0ixStandby::battTimerFired(OSObject *owner, IOTimerEventSource *sender)
 			self->findEcGpe();
 			if (self->ecGpe != 0xFFFFFFFF) self->publishEcWake();
 		}
+		self->publishTypeC();
 		self->publishLog();
 		sender->setTimeoutMS(60000);
 	}

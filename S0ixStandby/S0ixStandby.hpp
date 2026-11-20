@@ -282,6 +282,9 @@ private:
 	uint32_t iomV[5] {};                          // before entry, after entry(+fix), wake before exit, after exit, +2 s
 	thread_call_t iomCall {nullptr};
 	void setupIom();
+	// Type-C diagnostics (read-only): PCI PM state of 00:0d.0/0d.2/07.x and the TBT xHCI's PORTSC registers.
+	IOMemoryMap *txhcMap {nullptr};
+	void publishTypeC();
 	static void iomLater(thread_call_param_t self, thread_call_param_t);
 	void setupLidWake();
 	void lidPsw(bool on);
