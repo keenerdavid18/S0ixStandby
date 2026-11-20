@@ -265,6 +265,12 @@ private:
 	IOMemoryMap *lwGpioMap {nullptr};
 	volatile uint32_t *lwGpeSts {nullptr}, *lwGpeEn {nullptr};
 	uint32_t lwGpioBit {0}, lwGpeEnSaved {0}, lwGpeStsAtWake {0};
+	// -s0ixlidpad (with -s0ixlidwake): the lid GPE's pad is BIOS-disabled (PADCFG0 RX disabled, no SCI route). For the
+	// halt: RX on, SCI route, both edges; restore at wake. EC's legacy wake pin -> only HWxx-enabled events wake.
+	bool lwPad {false};
+	IOMemoryMap *lwPadMap {nullptr};
+	volatile uint32_t *lwPadCfg {nullptr};
+	uint32_t lwPadSaved {0}, lwPadHalt {0}, lwPadWake {0}, lwPadArmed {0};
 	bool lwGpioArmed {false};
 	// -s0ixecdrain: drain pending EC queries (SCI_EVT) at the halt so the EC can raise a fresh SCI (lid open), replay after.
 	bool edWake {false};

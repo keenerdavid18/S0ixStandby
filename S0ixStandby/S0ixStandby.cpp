@@ -444,6 +444,7 @@ bool S0ixStandby::start(IOService *provider)
 	edWake = bootArg("-s0ixecdrain");
 	iomNoDpof = bootArg("-s0ixnodpof");
 	tcssD3 = bootArg("-s0ixtcssd3");
+	lwPad = bootArg("-s0ixlidpad");
 	nvmeD0 = bootArg("-s0ixnvmed0");
 	nvmePs = nvmeD0 && bootArg("-s0ixnvmeps");
 	gNvmeCtl = nvmePs ? 2 : nvmeD0 ? 1 : 0;
@@ -1182,6 +1183,14 @@ IOReturn S0ixStandby::callPlatformFunction(const OSSymbol *functionName, bool wa
 			}
 			if (lwArm && lwGpe != 0xFFFFFFFF) lwEnReadback = gpeEnSet(gpe0EnPort, lwGpe);
 			lwGpioArmed = false;
+			lwPadArmed = 0;
+			if (lwArm && lwGpeEn && lwPadCfg) {
+				lwPadSaved = *lwPadCfg;
+				// RX on (clear bit 9), GPIROUTSCI (bit 19), RXEVCFG both edges (26:25 = 11); TX stays disabled
+				*lwPadCfg = (lwPadSaved & ~((1u << 9) | (3u << 25))) | (1u << 19) | (3u << 25);
+				lwPadHalt = *lwPadCfg;
+				lwPadArmed = 1;
+			}
 			if (lwArm && lwGpeEn) {
 				lwGpeEnSaved = *lwGpeEn;
 				*lwGpeSts = lwGpioBit;                             // clear a stale status (write 1)
@@ -1272,6 +1281,11 @@ IOReturn S0ixStandby::callPlatformFunction(const OSSymbol *functionName, bool wa
 					if (lwGpeStsAtWake & lwGpioBit) lwWoke = true;
 					*lwGpeEn = lwGpeEnSaved;                          // restore; ACPI clears the status when it handles _L17
 					lwGpioArmed = false;
+				}
+				if (lwPadArmed) {
+					lwPadWake = *lwPadCfg;                            // bit 1 = pin state (RX) right after the wake
+					*lwPadCfg = lwPadSaved;
+					lwPadArmed = 2;
 				}
 				if (kbArm) {
 					kbStsAtWake = inb(0x64);
@@ -2003,6 +2017,22 @@ void S0ixStandby::setupLidWake()
 					}
 				}
 			}
+			if (lwPad && !lwPadMap) {
+				OSObject *pargs[2] = { OSNumber::withNumber(grp, 32), OSNumber::withNumber(2, 32) };
+				OSObject *pres = nullptr;
+				uint64_t pc = 0;
+				if (pargs[0] && pargs[1] && sb->evaluateObject("GADR", &pres, pargs, 2) == kIOReturnSuccess && pres)
+					if (OSNumber *n = OSDynamicCast(OSNumber, pres)) pc = n->unsigned64BitValue() + (uint64_t)pad * 0x10;
+				OSSafeReleaseNULL(pres); OSSafeReleaseNULL(pargs[0]); OSSafeReleaseNULL(pargs[1]);
+				if (pc && (pc & 3) == 0)
+					if (IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pc & ~0xFFFULL, 0x1000, kIODirectionInOut)) {
+						lwPadMap = md->map(kIOMapInhibitCache);
+						md->release();
+						if (lwPadMap) lwPadCfg = reinterpret_cast<volatile uint32_t *>(lwPadMap->getVirtualAddress() + (pc & 0xFFF));
+					}
+				// sanity: the mapped register must read what GPC0 returned
+				if (lwPadCfg && *lwPadCfg != padcfg) { lwPadCfg = nullptr; OSSafeReleaseNULL(lwPadMap); }
+			}
 			snprintf(gb, sizeof(gb), "GPE 0x%x = GPIO group %u pad %u, GPI_GPE_STS 0x%llx (EN +0x20)%s, PADCFG0 0x%08x, HOSTSW_OWN %u [%s]",
 			         lwGpe, (unsigned)grp, pad, (unsigned long long)sts, lwGpeEn ? "" : " NOT MAPPED", padcfg, own, form);
 		} else {
@@ -2104,6 +2134,13 @@ void S0ixStandby::publishWakeInfo()
 			k += snprintf(en + k, sizeof(en) - k, "%02x", gpe0EnAtHalt[i]);
 		setProperty("GPE0_EN at last halt (byte 0 first)", en);
 		char rb[140];
+		if (lwPad) {
+			char pb[160];
+			snprintf(pb, sizeof(pb), "%s: PADCFG0 saved 0x%08x, halt 0x%08x, at wake 0x%08x (pin %u), GPI_GPE_STS at wake 0x%08x",
+			         lwPadCfg ? (lwPadArmed == 2 ? "armed last sleep" : "not armed last sleep") : "pad not mapped",
+			         lwPadSaved, lwPadHalt, lwPadWake, (lwPadWake >> 1) & 1, lwGpeStsAtWake);
+			setProperty("Lid wake pad", pb);
+		}
 		snprintf(rb, sizeof(rb), "lid GPE enable 0x%08x (GPIO GPI_GPE_EN when mapped), status at wake 0x%08x, EC GPE dword 0x%08x",
 		         lwEnReadback, lwGpeStsAtWake, ecEnReadback);
 		setProperty("GPE0_EN readback at last halt", rb);
