@@ -287,7 +287,7 @@ private:
 	void publishTypeC();
 	// -s0ixtcssd3: TCSS D3cold around Deep Idle like Linux RTD3 (TCSS xHCI 00:0d.0 D3hot, then \_SB.PC00.D3C._OFF -> TCOF
 	// -> IOM TD3C=1; wake: D3C._ON -> TCON (TD3C=0, waits TACK), xHCI back to its PM state).
-	bool tcssD3 {false}, tcssOff {false};
+	bool tcssD3 {false}, tcssOff {false}, tcssDirect {false};
 	IOACPIPlatformDevice *pc00 {nullptr};
 	IOPCIDevice *txhcDev {nullptr};
 	uint8_t txhcPm {0};

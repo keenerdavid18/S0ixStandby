@@ -1497,9 +1497,9 @@ void S0ixStandby::iomLater(thread_call_param_t self, thread_call_param_t)
 	me->setProperty("Type-C IOM at last sleep", b);
 	if (me->tcssD3) {
 		char t[260];
-		snprintf(t, sizeof(t), "%u sleeps; xHCI 0d.0 PMCSR at sleep 0x%04x (restored to 0x%04x); D3C._OFF 0x%x: IOM 0x%08x -> 0x%08x "
-		         "(TACK after %u ms); wake: IOM 0x%08x, D3C._ON 0x%x -> 0x%08x", me->tcssCount, me->txhcPmcsrSleep,
-		         me->txhcPmcsrSaved, me->tcssRet[0], me->tcssIom[0], me->tcssIom[1], me->tcssAckMs, me->tcssIom[2],
+		snprintf(t, sizeof(t), "%u sleeps; xHCI 0d.0 PMCSR at sleep 0x%04x (restored to 0x%04x); TCOF 0x%x%s: IOM 0x%08x -> 0x%08x "
+		         "(TACK after %u ms); wake: IOM 0x%08x, TCON 0x%x -> 0x%08x", me->tcssCount, me->txhcPmcsrSleep,
+		         me->txhcPmcsrSaved, me->tcssRet[0], me->tcssDirect ? " (direct TD3C write)" : "", me->tcssIom[0], me->tcssIom[1], me->tcssAckMs, me->tcssIom[2],
 		         me->tcssRet[1], me->tcssIom[3]);
 		me->setProperty("Type-C D3cold at last sleep", t);
 	}
@@ -1521,11 +1521,15 @@ void S0ixStandby::tcssSleep()
 		IODelay(10000);                                   // D0 -> D3hot: 10 ms
 	}
 	tcssIom[0] = *iomReg;
-	tcssRet[0] = pc00->evaluateObject("D3C._OFF");
+	// D3C._OFF only calls \_SB.PC00.TCOF; Apple's evaluateObject takes a plain device-relative name (a dotted path
+	// returned kIOReturnBadArgument). Fallback when TCOF is not defined (If (TRTD)): set TD3C (bit 15) directly.
+	tcssRet[0] = pc00->evaluateObject("TCOF");
+	tcssDirect = tcssRet[0] != kIOReturnSuccess;
+	if (tcssDirect) *iomReg = *iomReg | (1u << 15);
 	tcssAckMs = 0;
 	while (tcssAckMs < 100 && !(*iomReg & (1u << 16))) { IODelay(1000); tcssAckMs++; }
 	tcssIom[1] = *iomReg;
-	tcssOff = tcssRet[0] == kIOReturnSuccess;
+	tcssOff = (*iomReg & (1u << 15)) != 0;
 	if (!tcssOff && (txhcPmcsrSaved & 3) != 3) txhcDev->configWrite16(txhcPm + 4, txhcPmcsrSaved);
 }
 
@@ -1534,7 +1538,11 @@ void S0ixStandby::tcssWake()
 	if (!tcssOff) return;
 	tcssOff = false;
 	tcssIom[2] = iomReg ? *iomReg : 0;
-	tcssRet[1] = pc00->evaluateObject("D3C._ON");
+	tcssRet[1] = tcssDirect ? kIOReturnUnsupported : pc00->evaluateObject("TCON");
+	if (iomReg && (*iomReg & (1u << 15))) {                     // TCON missing or failed: clear TD3C, wait TACK low
+		*iomReg = *iomReg & ~(1u << 15);
+		for (int i = 0; i < 100 && (*iomReg & (1u << 16)); i++) IODelay(1000);
+	}
 	tcssIom[3] = iomReg ? *iomReg : 0;
 	if ((txhcPmcsrSaved & 3) != 3) {
 		uint16_t v = txhcDev->configRead16(txhcPm + 4);
