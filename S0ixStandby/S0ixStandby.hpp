@@ -285,6 +285,7 @@ private:
 	// Type-C diagnostics (read-only): PCI PM state of 00:0d.0/0d.2/07.x and the TBT xHCI's PORTSC registers.
 	IOMemoryMap *txhcMap {nullptr};
 	void publishTypeC();
+	uint64_t smiLast {0}, smiTscLast {0};
 	static void iomLater(thread_call_param_t self, thread_call_param_t);
 	void setupLidWake();
 	void lidPsw(bool on);

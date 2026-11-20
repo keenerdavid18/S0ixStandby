@@ -1317,6 +1317,18 @@ void S0ixStandby::publishTypeC()
 	it->release();
 	setProperty("Type-C PCI", pci);
 	setProperty("TXHC PORTSC", ports);
+	// MSR_SMI_COUNT (0x34): SMIs since reset - hidden firmware (SMM) time shows up as core power at OS idle.
+	uint64_t smi = rdmsr(0x34) & 0xffffffffULL, tsc = rdtsc();
+	char sb[96];
+	if (smiTscLast && tsc > smiTscLast) {
+		uint64_t dsmi = smi - smiLast;
+		snprintf(sb, sizeof(sb), "%llu total, +%llu since last sample (%llu M TSC ticks)", (unsigned long long)smi,
+		         (unsigned long long)dsmi, (unsigned long long)((tsc - smiTscLast) / 1000000ULL));
+	} else {
+		snprintf(sb, sizeof(sb), "%llu total", (unsigned long long)smi);
+	}
+	smiLast = smi; smiTscLast = tsc;
+	setProperty("SMI count", sb);
 }
 
 void S0ixStandby::setupIom()
