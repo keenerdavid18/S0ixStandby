@@ -285,6 +285,17 @@ private:
 	// Type-C diagnostics (read-only): PCI PM state of 00:0d.0/0d.2/07.x and the TBT xHCI's PORTSC registers.
 	IOMemoryMap *txhcMap {nullptr};
 	void publishTypeC();
+	// -s0ixtcssd3: TCSS D3cold around Deep Idle like Linux RTD3 (TCSS xHCI 00:0d.0 D3hot, then \_SB.PC00.D3C._OFF -> TCOF
+	// -> IOM TD3C=1; wake: D3C._ON -> TCON (TD3C=0, waits TACK), xHCI back to its PM state).
+	bool tcssD3 {false}, tcssOff {false};
+	IOACPIPlatformDevice *pc00 {nullptr};
+	IOPCIDevice *txhcDev {nullptr};
+	uint8_t txhcPm {0};
+	uint16_t txhcPmcsrSaved {0}, txhcPmcsrSleep {0};
+	uint32_t tcssIom[4] {}, tcssCount {0}, tcssAckMs {0};
+	IOReturn tcssRet[2] {};
+	void tcssSleep();
+	void tcssWake();
 	uint64_t smiLast {0}, smiTscLast {0};
 	static void iomLater(thread_call_param_t self, thread_call_param_t);
 	void setupLidWake();

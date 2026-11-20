@@ -430,6 +430,7 @@ bool S0ixStandby::start(IOService *provider)
 	kbWake = bootArg("-s0ixkbdwake");
 	edWake = bootArg("-s0ixecdrain");
 	iomNoDpof = bootArg("-s0ixnodpof");
+	tcssD3 = bootArg("-s0ixtcssd3");
 	uint32_t fn = 0;
 	if (PE_parse_boot_argn("s0ixfn", &fn, sizeof(fn)))
 		fnAllow = fn;
@@ -1415,6 +1416,7 @@ void S0ixStandby::publishTypeC()
 			if (d->findPCICapability(kIOPCIPowerManagementCapability, &pm) && pm) ps = d->configRead16(pm + 4) & 3;
 			n += snprintf(pci + n, sizeof(pci) - n, "%s%x.%x D%u", n ? ", " : "", w[0], w[1], ps);
 			if (w[0] == 0x0d && w[1] == 0) {
+				if (!txhcDev) { d->retain(); txhcDev = d; txhcPm = pm; }
 				if (!txhcMap) txhcMap = d->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0, kIOMapInhibitCache);
 				if (txhcMap && ps == 0) {
 					volatile uint8_t *b = reinterpret_cast<volatile uint8_t *>(txhcMap->getVirtualAddress());
@@ -1465,6 +1467,7 @@ void S0ixStandby::setupIom()
 	OSSafeReleaseNULL(nm);
 	OSObject *r = nullptr;
 	uint64_t base = 0;
+	if (pc && !pc00) { pc->retain(); pc00 = pc; }
 	if (pc && pc->evaluateObject("IOMA", &r) == kIOReturnSuccess && r)
 		if (OSNumber *n = OSDynamicCast(OSNumber, r)) base = n->unsigned64BitValue();
 	OSSafeReleaseNULL(r);
@@ -1492,7 +1495,53 @@ void S0ixStandby::iomLater(thread_call_param_t self, thread_call_param_t)
 	snprintf(b, sizeof(b), "before entry 0x%08x, after entry 0x%08x, wake before exit 0x%08x, after exit 0x%08x, +2 s 0x%08x",
 	         me->iomV[0], me->iomV[1], me->iomV[2], me->iomV[3], me->iomV[4]);
 	me->setProperty("Type-C IOM at last sleep", b);
+	if (me->tcssD3) {
+		char t[260];
+		snprintf(t, sizeof(t), "%u sleeps; xHCI 0d.0 PMCSR at sleep 0x%04x (restored to 0x%04x); D3C._OFF 0x%x: IOM 0x%08x -> 0x%08x "
+		         "(TACK after %u ms); wake: IOM 0x%08x, D3C._ON 0x%x -> 0x%08x", me->tcssCount, me->txhcPmcsrSleep,
+		         me->txhcPmcsrSaved, me->tcssRet[0], me->tcssIom[0], me->tcssIom[1], me->tcssAckMs, me->tcssIom[2],
+		         me->tcssRet[1], me->tcssIom[3]);
+		me->setProperty("Type-C D3cold at last sleep", t);
+	}
 	me->publishTypeC();
+}
+
+// TCSS D3cold (-s0ixtcssd3). The DSDT's TCSS xHCI (TXHC) has _PR0/_PR3 = \_SB.PC00.D3C; its _OFF (TCOF) sets the IOM's
+// TD3C bit when no TCSS device asks to skip D3cold, _ON (TCON) clears it and waits for TACK. macOS never does ACPI
+// runtime D3 for these devices, so TD3C stayed 0 in every Deep Idle and the package never left PC2 once the IOM was
+// told the display is off (DPOF or DC9). Only with nothing attached to USB-C (never sleep docked).
+void S0ixStandby::tcssSleep()
+{
+	tcssOff = false;
+	if (!pc00 || !txhcDev || !txhcPm || !iomReg) return;
+	txhcPmcsrSleep = txhcDev->configRead16(txhcPm + 4);
+	txhcPmcsrSaved = txhcPmcsrSleep;
+	if ((txhcPmcsrSleep & 3) != 3) {
+		txhcDev->configWrite16(txhcPm + 4, (uint16_t)((txhcPmcsrSleep & ~3) | 3));
+		IODelay(10000);                                   // D0 -> D3hot: 10 ms
+	}
+	tcssIom[0] = *iomReg;
+	tcssRet[0] = pc00->evaluateObject("D3C._OFF");
+	tcssAckMs = 0;
+	while (tcssAckMs < 100 && !(*iomReg & (1u << 16))) { IODelay(1000); tcssAckMs++; }
+	tcssIom[1] = *iomReg;
+	tcssOff = tcssRet[0] == kIOReturnSuccess;
+	if (!tcssOff && (txhcPmcsrSaved & 3) != 3) txhcDev->configWrite16(txhcPm + 4, txhcPmcsrSaved);
+}
+
+void S0ixStandby::tcssWake()
+{
+	if (!tcssOff) return;
+	tcssOff = false;
+	tcssIom[2] = iomReg ? *iomReg : 0;
+	tcssRet[1] = pc00->evaluateObject("D3C._ON");
+	tcssIom[3] = iomReg ? *iomReg : 0;
+	if ((txhcPmcsrSaved & 3) != 3) {
+		uint16_t v = txhcDev->configRead16(txhcPm + 4);
+		txhcDev->configWrite16(txhcPm + 4, (uint16_t)((v & ~3) | (txhcPmcsrSaved & 3)));
+		IODelay(10000);
+	}
+	tcssCount++;
 }
 
 void S0ixStandby::setupLidWake()
@@ -1852,6 +1901,7 @@ void S0ixStandby::onSleep()
 	wifiPmcsrSleep = wifiDev ? wifiDev->configRead16(wifiPmCap + 4) : 0xFFFF;
 
 	if (lwWake && lastSleepType == kSleepTypeDeepIdle) lidPsw(true);   // while the EC still answers normally
+	if (tcssD3 && lastSleepType == kSleepTypeDeepIdle) tcssSleep();   // before the LPS0 entry _DSM, like Linux
 	entered = false;
 	if (dsmEnabled && lastSleepType == kSleepTypeDeepIdle &&
 	    (dsmMask[kIntel] || dsmMask[kMicrosoft] || dsmMask[kAMD])) {
@@ -2002,6 +2052,7 @@ void S0ixStandby::onWake()
 		}
 		entered = false;
 	}
+	tcssWake();
 	if (lwWake && lastSleepType == kSleepTypeDeepIdle) lidPsw(false);
 	// Before any driver wakes: Apple's accelerator restarts the engines later.
 	if (gpuMMIO) {
