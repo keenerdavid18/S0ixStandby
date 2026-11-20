@@ -222,6 +222,49 @@ static inline uint64_t rdtsc()
 	return ((uint64_t)hi << 32) | lo;
 }
 
+// Per-CPU core residency, read on demand on every CPU (sysctl debug.s0ix.cores, read-only, no root):
+// per logical CPU 48 bytes {u32 valid, u32 core type (CPUID 0x1A eax[31:24]: 0x20 Atom, 0x40 Core), u64 TSC,
+// u64 MSR 0x3FC core C3, 0x3FD core C6, 0x3FE core C7, 0x664 Atom module C6} (~0 = read failed). Read it just before
+// and right after a Deep Idle sleep: the deltas show which CPUs stayed deep through the halt (offline CPUs that
+// take an interrupt in _xcpm_cpu_halt fall back to cli;hlt = C1 for the rest of the sleep).
+extern "C" int rdmsr_carefully(uint32_t msr, uint32_t *lo, uint32_t *hi);
+extern "C" void mp_rendezvous_no_intrs(void (*action_func)(void *), void *arg);
+extern "C" int cpu_number(void);
+#include <sys/sysctl.h>
+#include <sys/errno.h>
+static constexpr int kCoreSnapMax = 32;
+struct CoreSnap { uint32_t valid, type; uint64_t tsc, c3, c6, c7, mc6; };
+static CoreSnap gCoreSnap[kCoreSnapMax];
+static void coreSnapOne(void *)
+{
+	int cpu = cpu_number();
+	if (cpu < 0 || cpu >= kCoreSnapMax) return;
+	auto rd = [](uint32_t msr) -> uint64_t {
+		uint32_t lo = 0, hi = 0;
+		return rdmsr_carefully(msr, &lo, &hi) == 0 ? ((uint64_t)hi << 32 | lo) : ~0ULL;
+	};
+	uint32_t lo, hi, a, b, c, d;
+	asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
+	asm volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x1A), "c"(0));
+	gCoreSnap[cpu] = {1, a >> 24, (uint64_t)hi << 32 | lo, rd(0x3FC), rd(0x3FD), rd(0x3FE), rd(0x664)};
+}
+static IOLock *gCoreSnapLock;
+static int coreSnapHandler(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+	if (req->newptr) return EPERM;
+	if (!gCoreSnapLock) return ENOENT;
+	IOLockLock(gCoreSnapLock);
+	bzero(gCoreSnap, sizeof(gCoreSnap));
+	mp_rendezvous_no_intrs(coreSnapOne, nullptr);
+	int err = SYSCTL_OUT(req, gCoreSnap, sizeof(gCoreSnap));
+	IOLockUnlock(gCoreSnapLock);
+	return err;
+}
+SYSCTL_DECL(_debug);
+SYSCTL_NODE(_debug, OID_AUTO, s0ix, CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, "S0ixStandby");
+SYSCTL_PROC(_debug_s0ix, OID_AUTO, cores, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
+            coreSnapHandler, "S", "per-CPU TSC + core C3/C6/C7 + Atom module C6 residency");
+
 // C-state residency MSRs (Intel SDM vol. 4). All count at TSC rate.
 struct CState { const char *name; uint32_t msr; };
 static const CState kCStates[] = {
@@ -480,12 +523,21 @@ bool S0ixStandby::start(IOService *provider)
 	LOG("started on %s (Intel 0x%x, Microsoft 0x%x, AMD 0x%x, dsm %s)",
 	    lps0->getName(), dsmMask[kIntel], dsmMask[kMicrosoft], dsmMask[kAMD],
 	    dsmEnabled ? "on" : "off");
+	if (!gCoreSnapLock) gCoreSnapLock = IOLockAlloc();
+	if (gCoreSnapLock) {
+		sysctl_register_oid(&sysctl__debug_s0ix);
+		sysctl_register_oid(&sysctl__debug_s0ix_cores);
+	}
 	publishLog();
 	return true;
 }
 
 void S0ixStandby::stop(IOService *provider)
 {
+	if (gCoreSnapLock) {
+		sysctl_unregister_oid(&sysctl__debug_s0ix_cores);
+		sysctl_unregister_oid(&sysctl__debug_s0ix);
+	}
 	if (publishTimer) {
 		publishTimer->cancelTimeout();
 		if (workLoop) workLoop->removeEventSource(publishTimer);
