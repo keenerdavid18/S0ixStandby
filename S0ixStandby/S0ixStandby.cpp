@@ -159,6 +159,15 @@ static const uint32_t kSleepTypeDeepIdle = 7;   // kIOPMSleepTypeDeepIdle
 static const uint16_t kPm1RtcEn = 1u << 10;      // PM1_EN.RTC_EN (ACPI fixed event)
 static const uint16_t kPm1PwrBtn = 1u << 8;       // PM1_STS.PWRBTN_STS / PM1_EN.PWRBTN_EN
 static uint8_t kbcArm(uint8_t &before, uint8_t &after);
+// ACPI EC (ECDT: data 0x62, command/status 0x66). Status: bit0 OBF, bit1 IBF, bit5 SCI_EVT.
+static bool ecWait(uint8_t mask, uint8_t want)
+{
+	for (int i = 0; i < 2000; i++) {                      // up to ~20 ms
+		if ((inb(0x66) & mask) == want) return true;
+		IODelay(10);
+	}
+	return false;
+}
 // PCH GPE0 registers: use aligned 32-bit I/O (byte writes to GPE0_EN did not stick on Alder/Raptor Lake PCH).
 static uint32_t gpeEnSet(uint16_t enBase, uint32_t gpe)
 {
@@ -321,6 +330,7 @@ bool S0ixStandby::start(IOService *provider)
 	pbWake = bootArg("-s0ixpwrbtn");
 	lwWake = bootArg("-s0ixlidwake");
 	kbWake = bootArg("-s0ixkbdwake");
+	edWake = bootArg("-s0ixecdrain");
 	uint32_t fn = 0;
 	if (PE_parse_boot_argn("s0ixfn", &fn, sizeof(fn)))
 		fnAllow = fn;
@@ -1049,6 +1059,20 @@ IOReturn S0ixStandby::callPlatformFunction(const OSSymbol *functionName, bool wa
 				outw(pbEnPort, (uint16_t)(inw(pbEnPort) | kPm1PwrBtn));
 				pbArmed = true;
 			}
+			if (edWake && lastSleepType == kSleepTypeDeepIdle) {
+				ecStsAtHalt = inb(0x66);
+				edGpeStsAtHalt = (gpe0StsPort && ecGpe != 0xFFFFFFFF) ? ((inl((uint16_t)(gpe0StsPort + (ecGpe / 32) * 4)) >> (ecGpe % 32)) & 1) : false;
+				edN = 0;
+				for (int i = 0; i < 8 && (inb(0x66) & 0x20); i++) {   // SCI_EVT: a query is pending
+					if (!ecWait(0x02, 0)) break;
+					outb(0x66, 0x84);                                      // QR_EC
+					if (!ecWait(0x01, 0x01)) break;
+					uint8_t q = inb(0x62);
+					if (q && edN < sizeof(edQ)) edQ[edN++] = q;
+				}
+				if (gpe0StsPort && ecGpe != 0xFFFFFFFF)                // clear the EC GPE status so a new SCI edge can wake us
+					outl((uint16_t)(gpe0StsPort + (ecGpe / 32) * 4), 1u << (ecGpe % 32));
+			}
 			if (ecArm) {
 				// Last thing before the halt: macOS has set up its wake GPEs.
 				uint16_t p = (uint16_t)(gpe0EnPort + (ecGpe / 32) * 4);
@@ -1082,6 +1106,7 @@ IOReturn S0ixStandby::callPlatformFunction(const OSSymbol *functionName, bool wa
 			if (gpe0StsPort) {
 				// What woke the CPU: status bits are still set here (cleared later by ACPI).
 				pm1StsAtWake = pm1StsPort ? inw(pm1StsPort) : 0;
+				if (edWake) ecStsAtWakeP = inb(0x66);
 				if (pbArmed) {
 					outw(pbEnPort, (uint16_t)(inw(pbEnPort) & ~kPm1PwrBtn));   // never leave it on: nobody handles it awake
 					if (pm1StsAtWake & kPm1PwrBtn) { outw(pm1StsPort, kPm1PwrBtn); pbWoke = true; }
@@ -1191,6 +1216,8 @@ void S0ixStandby::setupWakeInfo()
 		setProperty("Power button wake", pb);
 		LOG("Power button wake %s", pb);
 		if (pbWake && pbEnPort && !pbCall) pbCall = thread_call_allocate(pbUserActive, this);
+		if (edWake && !edCall) edCall = thread_call_allocate(edReplay, this);
+		setProperty("EC drain", edWake ? "on (-s0ixecdrain)" : "off (boot-arg -s0ixecdrain)");
 	}
 	if (gpe && gpe + gpeLen <= 0xFFFF && gpeLen >= 2 && !(gpeLen & 1)) {
 		gpe0StsPort = (uint16_t)gpe;
@@ -1394,6 +1421,7 @@ void S0ixStandby::findEcGpe()
 			if (ec->evaluateInteger("_GPE", &v) == kIOReturnSuccess) {
 				ecGpe = v;
 				ecGpeFrom = ec->getName();
+				if (!ecDev) { ecDev = ec; ecDev->retain(); }
 				break;
 			}
 		}
@@ -1625,6 +1653,19 @@ void S0ixStandby::onSleep()
 	    counterAtSleep, rtcBlocked ? "blocked (AC)" : "allowed");
 }
 
+void S0ixStandby::edReplay(thread_call_param_t self, thread_call_param_t)
+{
+	// Run the EC query methods we drained at the halt, so no EC event (battery, AC, lid, keys) is lost.
+	S0ixStandby *me = static_cast<S0ixStandby *>(self);
+	uint8_t n = me->edN;
+	me->edN = 0;
+	for (uint8_t i = 0; i < n && me->ecDev; i++) {
+		char name[8]; snprintf(name, sizeof(name), "_Q%02X", me->edQ[i]);
+		IOReturn r = me->ecDev->evaluateObject(name);
+		LOG("EC drain replay %s -> 0x%x", name, r);
+	}
+}
+
 void S0ixStandby::pbUserActive(thread_call_param_t self, thread_call_param_t)
 {
 	// Same call the HID system makes on user input: in a dark wake the root domain turns it into a full wake
@@ -1661,6 +1702,17 @@ void S0ixStandby::onWake()
 	ecArmed = false;
 	if (wakeInfoValid && ecGpe != 0xFFFFFFFF && (gpe0StsAtWake[ecGpe / 8] >> (ecGpe % 8) & 1))
 		ecWakeCount++;
+	if (edWake && lastSleepType == kSleepTypeDeepIdle) {
+		char ed[160]; int n = snprintf(ed, sizeof(ed), "EC status at halt 0x%02x (GPE sts %d), drained %u:", ecStsAtHalt,
+		                               (int)edGpeStsAtHalt, edN);
+		for (uint8_t i = 0; i < edN && n < (int)sizeof(ed) - 6; i++) n += snprintf(ed + n, sizeof(ed) - (size_t)n, " _Q%02X", edQ[i]);
+		snprintf(ed + n, sizeof(ed) - (size_t)n, "; EC status at wake 0x%02x", ecStsAtWakeP);
+		setProperty("EC drain at last sleep", ed);
+		if (edN && ecDev && edCall) {
+			uint64_t dl; clock_interval_to_deadline(500, kMillisecondScale, &dl);
+			thread_call_enter_delayed(edCall, dl);
+		}
+	}
 	if (kbWake) {
 		char kb[160];
 		snprintf(kb, sizeof(kb), "%s, arm result %u, command byte 0x%02x -> 0x%02x, status at wake 0x%02x, IRQ1 RTE 0x%08x:%08x%s",

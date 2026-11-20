@@ -265,6 +265,13 @@ private:
 	volatile uint32_t *lwGpeSts {nullptr}, *lwGpeEn {nullptr};
 	uint32_t lwGpioBit {0}, lwGpeEnSaved {0}, lwGpeStsAtWake {0};
 	bool lwGpioArmed {false};
+	// -s0ixecdrain: drain pending EC queries (SCI_EVT) at the halt so the EC can raise a fresh SCI (lid open), replay after.
+	bool edWake {false};
+	IOACPIPlatformDevice *ecDev {nullptr};
+	uint8_t edQ[8] {}, edN {0}, ecStsAtHalt {0}, ecStsAtWakeP {0};
+	bool edGpeStsAtHalt {false};
+	thread_call_t edCall {nullptr};
+	static void edReplay(thread_call_param_t self, thread_call_param_t);
 	void setupLidWake();
 	void lidPsw(bool on);
 	thread_call_t pbCall {nullptr};
