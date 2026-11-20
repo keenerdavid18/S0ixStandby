@@ -244,6 +244,14 @@ private:
 	uint16_t pbEnPort {0};
 	uint32_t pbWakeCount {0};
 	uint32_t pbTickles {0};
+	// -s0ixlidwake: EC wake line for lid / sleep button (their _PSW + _PRW GPE), like Linux does for s2idle.
+	bool lwWake {false}, lwArm {false};
+	volatile bool lwWoke {false};
+	IOACPIPlatformDevice *lwDev[2] {nullptr, nullptr};
+	uint32_t lwGpe {0xFFFFFFFF}, lwWakeCount {0};
+	uint8_t gpe0EnAtHalt[16] {};
+	void setupLidWake();
+	void lidPsw(bool on);
 	thread_call_t pbCall {nullptr};
 	static void pbUserActive(thread_call_param_t self, thread_call_param_t);
 	uint16_t pm1StsPort {0}, gpe0StsPort {0}, gpe0EnPort {0};

@@ -310,6 +310,7 @@ bool S0ixStandby::start(IOService *provider)
 	acNoRtc = bootArg("-s0ixacnortc");
 	ecWake = bootArg("-s0ixecwake");
 	pbWake = bootArg("-s0ixpwrbtn");
+	lwWake = bootArg("-s0ixlidwake");
 	uint32_t fn = 0;
 	if (PE_parse_boot_argn("s0ixfn", &fn, sizeof(fn)))
 		fnAllow = fn;
@@ -410,6 +411,7 @@ bool S0ixStandby::start(IOService *provider)
 	}
 
 	setupWakeInfo();
+	setupLidWake();
 
 	if (workLoop) {
 		battTimer = IOTimerEventSource::timerEventSource(this, &S0ixStandby::battTimerFired);
@@ -1010,6 +1012,14 @@ IOReturn S0ixStandby::callPlatformFunction(const OSSymbol *functionName, bool wa
 		// Interrupts are disabled in these two: MSR reads only, no locks/logging.
 		if (functionName->isEqualTo("IOPlatformQuiesceAction")) {
 			if (rtcBlocked) outw(pm1EnPort, (uint16_t)(inw(pm1EnPort) & ~kPm1RtcEn));
+			if (lwArm && lwGpe != 0xFFFFFFFF) {
+				uint16_t p = (uint16_t)(gpe0EnPort + lwGpe / 8);
+				uint8_t m = (uint8_t)(1u << (lwGpe % 8)), v = inb(p);
+				if (!(v & m)) outb(p, (uint8_t)(v | m));
+			}
+			if (gpe0EnPort)
+				for (uint32_t i = 0; i < gpe0Half && i < sizeof(gpe0EnAtHalt); i++)
+					gpe0EnAtHalt[i] = inb((uint16_t)(gpe0EnPort + i));
 			if (pbArm) {
 				// The laptop reports its power button through the EC (FADT control-method button), so the OS
 				// never enables the PCH's fixed PWRBTN event; the EC is in standby and does not deliver the
@@ -1053,6 +1063,7 @@ IOReturn S0ixStandby::callPlatformFunction(const OSSymbol *functionName, bool wa
 				for (uint32_t i = 0; i < gpe0Half && i < sizeof(gpe0StsAtWake); i++)
 					gpe0StsAtWake[i] = inb((uint16_t)(gpe0StsPort + i));
 				wakeInfoValid = true;
+				if (lwArm && lwGpe != 0xFFFFFFFF && (gpe0StsAtWake[lwGpe / 8] >> (lwGpe % 8) & 1)) lwWoke = true;
 			}
 			if (pmcDump && counterPage && pmcHaltValid) {
 				for (uint32_t i = 0; i < 1024; i++) pmcAtActive[i] = counterPage[i];
@@ -1157,6 +1168,57 @@ void S0ixStandby::setupWakeInfo()
 // The EC's GPE number: s0ixecgpe=N overrides; otherwise _GPE of the PNP0C09
 // device, searched in the ACPI plane (the EC nub isn't always registered yet,
 // or at all). An integer is a GPE0 bit; a package means a GPE block device.
+// Lid (PNP0C0D) and sleep button (PNP0C0E): on ThinkPads their _PSW sets the EC's wake-on-lid-open / wake-on-Fn bits
+// and _PRW names the EC's wake GPE. macOS does not do this for Deep Idle, so the lid never wakes the machine.
+void S0ixStandby::setupLidWake()
+{
+	if (!lwWake) { setProperty("Lid wake", "off (boot-arg -s0ixlidwake)"); return; }
+	static const char *hids[2] = { "PNP0C0D", "PNP0C0E" };
+	const IORegistryPlane *plane = IORegistryEntry::getPlane("IOACPIPlane");
+	if (!plane) return;
+	for (int i = 0; i < 2; i++) {
+		OSString *hid = OSString::withCString(hids[i]);
+		if (!hid) continue;
+		if (IORegistryIterator *it = IORegistryIterator::iterateOver(plane, kIORegistryIterateRecursively)) {
+			while (IORegistryEntry *e = it->getNextObject()) {
+				IOACPIPlatformDevice *d = OSDynamicCast(IOACPIPlatformDevice, e);
+				if (!d || !d->compareName(hid, nullptr)) continue;
+				d->retain();
+				lwDev[i] = d;
+				OSObject *prw = nullptr;
+				if (lwGpe == 0xFFFFFFFF && d->evaluateObject("_PRW", &prw) == kIOReturnSuccess && prw) {
+					if (OSArray *a = OSDynamicCast(OSArray, prw))
+						if (OSNumber *n = OSDynamicCast(OSNumber, a->getObject(0)))
+							lwGpe = n->unsigned32BitValue();
+				}
+				OSSafeReleaseNULL(prw);
+				break;
+			}
+			it->release();
+		}
+		hid->release();
+	}
+	if (lwGpe != 0xFFFFFFFF && (!gpe0EnPort || lwGpe / 8 >= gpe0Half)) lwGpe = 0xFFFFFFFF;
+	char buf[128];
+	snprintf(buf, sizeof(buf), "armed during Deep Idle (-s0ixlidwake): lid %s, sleep button %s, wake GPE 0x%x",
+	         lwDev[0] ? lwDev[0]->getName() : "not found", lwDev[1] ? lwDev[1]->getName() : "not found", lwGpe);
+	setProperty("Lid wake", buf);
+	LOG("Lid wake %s", buf);
+	if (!pbCall) pbCall = thread_call_allocate(pbUserActive, this);
+}
+
+void S0ixStandby::lidPsw(bool on)
+{
+	for (int i = 0; i < 2; i++) {
+		if (!lwDev[i]) continue;
+		OSObject *arg = OSNumber::withNumber(on ? 1 : 0, 32);
+		if (!arg) continue;
+		IOReturn r = lwDev[i]->evaluateObject("_PSW", nullptr, &arg, 1);
+		DBG("%s._PSW(%d) -> 0x%x", lwDev[i]->getName(), on ? 1 : 0, r);
+		arg->release();
+	}
+}
+
 void S0ixStandby::findEcGpe()
 {
 	uint32_t forced = 0;
@@ -1222,6 +1284,12 @@ void S0ixStandby::publishWakeInfo()
 			}
 	if (!n) snprintf(buf, sizeof(buf), "none latched (PM1_STS 0x%04x)", pm1StsAtWake);
 	setProperty("Last wake source", buf);
+	{
+		char en[2 * sizeof(gpe0EnAtHalt) + 1]; size_t k = 0;
+		for (uint32_t i = 0; i < gpe0Half && i < sizeof(gpe0EnAtHalt); i++)
+			k += snprintf(en + k, sizeof(en) - k, "%02x", gpe0EnAtHalt[i]);
+		setProperty("GPE0_EN at last halt (byte 0 first)", en);
+	}
 	if (ecGpe != 0xFFFFFFFF) {
 		snprintf(buf, sizeof(buf), "%s by macOS%s", ecEnAtHalt ? "enabled" : "disabled",
 		         ecWake && !ecEnAtHalt ? ", armed by -s0ixecwake" : "");
@@ -1361,6 +1429,7 @@ void S0ixStandby::onSleep()
 	// Drivers (and IOPCIFamily's D3 transition) are done by now.
 	wifiPmcsrSleep = wifiDev ? wifiDev->configRead16(wifiPmCap + 4) : 0xFFFF;
 
+	if (lwWake && lastSleepType == kSleepTypeDeepIdle) lidPsw(true);   // while the EC still answers normally
 	entered = false;
 	if (dsmEnabled && lastSleepType == kSleepTypeDeepIdle &&
 	    (dsmMask[kIntel] || dsmMask[kMicrosoft] || dsmMask[kAMD])) {
@@ -1382,6 +1451,8 @@ void S0ixStandby::onSleep()
 	}
 	ecArm = ecWake && gpe0EnPort && ecGpe != 0xFFFFFFFF && lastSleepType == kSleepTypeDeepIdle;
 	pbArm = pbWake && pbEnPort && pm1StsPort && gpe0StsPort && lastSleepType == kSleepTypeDeepIdle;
+	lwArm = lwWake && (lwDev[0] || lwDev[1]) && lastSleepType == kSleepTypeDeepIdle;
+	lwWoke = false;
 	pbArmed = false; pbWoke = false;
 	ecArmed = false;
 	wakeInfoValid = false;
@@ -1425,6 +1496,16 @@ void S0ixStandby::onWake()
 	ecArmed = false;
 	if (wakeInfoValid && ecGpe != 0xFFFFFFFF && (gpe0StsAtWake[ecGpe / 8] >> (ecGpe % 8) & 1))
 		ecWakeCount++;
+	if (lwWoke) {
+		lwWoke = false;
+		lwWakeCount++;
+		setProperty("Lid wakes", (unsigned long long)lwWakeCount, 32);
+		pbTickles = 0;
+		if (pbCall) {
+			uint64_t dl; clock_interval_to_deadline(300, kMillisecondScale, &dl);
+			thread_call_enter_delayed(pbCall, dl);
+		}
+	}
 	if (pbWoke) {
 		// macOS sees no wake reason and would stay in dark wake and sleep again: ask for a full (user) wake
 		// once the wake transition is under way.
@@ -1441,6 +1522,7 @@ void S0ixStandby::onWake()
 		dsmExit();
 		entered = false;
 	}
+	if (lwWake && lastSleepType == kSleepTypeDeepIdle) lidPsw(false);
 	// Before any driver wakes: Apple's accelerator restarts the engines later.
 	if (gpuMMIO) {
 		dispCapture(dispAtWake, &dispAtSleep);
