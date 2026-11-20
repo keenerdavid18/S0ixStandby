@@ -1609,6 +1609,14 @@ void S0ixStandby::nvmePrep()
 		}
 		if (!nvBar[i] && nvDev[i]->configRead16(nvPm[i] + 4) != 0xFFFF && !(nvDev[i]->configRead16(nvPm[i] + 4) & 3))
 			nvBar[i] = nvDev[i]->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0, kIOMapInhibitCache);
+		if ((gNvmeCtl & 0x60) && nvHmbN[i] < kHmbChunks) {
+			for (uint32_t c = nvHmbN[i]; c < kHmbChunks; c++) {
+				IOBufferMemoryDescriptor *b = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+					kIODirectionInOut | kIOMemoryPhysicallyContiguous, kHmbChunkBytes, 0x0000FFFFFFFFF000ULL);
+				if (!b || b->prepare() != kIOReturnSuccess) { OSSafeReleaseNULL(b); break; }
+				nvHmb[i][c] = b; nvHmbN[i] = c + 1;
+			}
+		}
 	}
 }
 
@@ -1727,13 +1735,52 @@ bool S0ixStandby::nvmeCtrlPs(uint32_t i)
 	if (ioq) ioq = admin(0x05, 4, pa + 4 * 4096, (3u << 16) | 1u, 1u, st) && !st;        // Create I/O CQ 1, 4 entries, PC, no IRQ
 	const uint32_t stCq = st;
 	if (ioq) ioq = admin(0x01, 5, pa + 3 * 4096, (3u << 16) | 1u, (1u << 16) | 1u, st) && !st;   // Create I/O SQ 1 -> CQ 1, PC
+	// Host Memory Buffer (Identify: HMPRE @272, HMMIN @276 in 4 KB units, HMMINDS @332, HMMAXD @336)
+	const uint32_t hmpre = *reinterpret_cast<const uint32_t *>(id + 272), hmmin = *reinterpret_cast<const uint32_t *>(id + 276);
+	const uint16_t hmmaxd = *reinterpret_cast<const uint16_t *>(id + 336);
+	char hmb[48] = "no HMB";
+	uint32_t hmbSt = 0;
+	if ((nvMode & 0x60) && hmmin) {
+		const uint32_t pages = kHmbChunkBytes / 4096, need = (hmmin + pages - 1) / pages;
+		if (nvHmbN[i] < need || (hmmaxd && hmmaxd < need)) {
+			snprintf(hmb, sizeof(hmb), "HMB skipped (%u of %u chunks, maxd %u)", nvHmbN[i], need, hmmaxd);
+		} else {
+			uint32_t *dl = reinterpret_cast<uint32_t *>(mem + 8192);     // descriptor list (identify page, already parsed)
+			bzero(dl, 4096);
+			for (uint32_t c = 0; c < need; c++) {
+				const uint64_t a = nvHmb[i][c]->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+				dl[c * 4] = (uint32_t)a; dl[c * 4 + 1] = (uint32_t)(a >> 32); dl[c * 4 + 2] = pages;
+			}
+			auto sf = [&](uint16_t cid, uint32_t c11, uint32_t c12, uint64_t list, uint32_t cnt, uint32_t &stat) {
+				volatile uint32_t *sq = reinterpret_cast<volatile uint32_t *>(mem + tail * 64);
+				for (int k = 0; k < 16; k++) sq[k] = 0;
+				sq[0] = 0x09 | ((uint32_t)cid << 16);
+				sq[10] = 0x0D; sq[11] = c11; sq[12] = c12; sq[13] = (uint32_t)list; sq[14] = (uint32_t)(list >> 32); sq[15] = cnt;
+				const uint32_t slot = tail; tail = (tail + 1) & 7;
+				OSSynchronizeIO(); w32(0x1000, tail);
+				volatile uint32_t *cq = reinterpret_cast<volatile uint32_t *>(mem + 4096 + slot * 16);
+				for (int t = 0; t < 4000; t++) {
+					if (cq[3] & 0x10000) { stat = (cq[3] >> 17) & 0x7FFF; w32(0x1000 + (4u << dstrd), tail); return true; }
+					IODelay(500);
+				}
+				return false;
+			};
+			const bool on = sf(6, 1, need * pages, pa + 8192, need, hmbSt) && !hmbSt;
+			if (on) IODelay(200000);                                            // let the drive load its tables
+			bool off = true;
+			if (on && !(nvMode & 0x40)) off = sf(7, 0, 0, 0, 0, hmbSt) && !hmbSt;   // Linux: disable before PS
+			snprintf(hmb, sizeof(hmb), "HMB %u MB %s%s (0x%x)", need * pages / 256, on ? "on" : "FAILED",
+			         on ? ((nvMode & 0x40) ? ", kept" : off ? ", off" : ", off FAILED") : "", hmbSt);
+		}
+	}
+	(void)hmpre;
 	uint8_t msix = 0; d->findPCICapability(kIOPCIMSIXCapability, &msix);
 	const bool msixOn = msix && (d->configRead16(msix + 2) & 0x8000);
 	if (!admin(0x09, 2, 0, 0x02, (uint32_t)ps, st) || st) {    // Set Features: Power Management
 		snprintf(nvPsInfo[i], sizeof(nvPsInfo[i]), "set PS%d failed (status 0x%x, npss %u)", ps, st, npss); w32(0x14, 0); waitRdy(0); return false;
 	}
-	snprintf(nvPsInfo[i], sizeof(nvPsInfo[i]), "PS%d of 0-%u, I/O queues %s (nq %x cq %x sq %x), MSI-X %s", ps, npss,
-	         ioq ? "ok" : "FAILED", stNq, stCq, st, msix ? (msixOn ? "on" : "off") : "none");
+	snprintf(nvPsInfo[i], sizeof(nvPsInfo[i]), "PS%d of 0-%u, I/O queues %s, MSI-X %s, %s", ps, npss,
+	         ioq ? "ok" : "FAILED", msix ? (msixOn ? "on" : "off") : "none", hmb);
 	return true;
 }
 

@@ -338,6 +338,12 @@ private:
 	uint32_t nvMode {0};
 	uint8_t nvMsix[kNvMax] {};
 	uint16_t nvMsixSaved[kNvMax] {};
+	// Host Memory Buffer for DRAM-less drives (debug.s0ix.nvme +0x20: enable, settle, disable before PS4 like Linux;
+	// +0x40: keep it enabled through the halt). 16 x 4 MB physically contiguous chunks per drive, allocated awake.
+	static constexpr int kHmbChunks = 16;
+	static constexpr uint32_t kHmbChunkBytes = 4u << 20;
+	IOBufferMemoryDescriptor *nvHmb[kNvMax][kHmbChunks] {};
+	uint32_t nvHmbN[kNvMax] {};
 	void nvmeCtrlReset(uint32_t i);
 	uint64_t smiLast {0}, smiTscLast {0};
 	static void iomLater(thread_call_param_t self, thread_call_param_t);
