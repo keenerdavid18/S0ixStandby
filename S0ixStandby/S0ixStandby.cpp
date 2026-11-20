@@ -331,6 +331,7 @@ bool S0ixStandby::start(IOService *provider)
 	lwWake = bootArg("-s0ixlidwake");
 	kbWake = bootArg("-s0ixkbdwake");
 	edWake = bootArg("-s0ixecdrain");
+	iomNoDpof = bootArg("-s0ixnodpof");
 	uint32_t fn = 0;
 	if (PE_parse_boot_argn("s0ixfn", &fn, sizeof(fn)))
 		fnAllow = fn;
@@ -432,6 +433,7 @@ bool S0ixStandby::start(IOService *provider)
 
 	setupWakeInfo();
 	setupLidWake();
+	setupIom();
 
 	if (workLoop) {
 		battTimer = IOTimerEventSource::timerEventSource(this, &S0ixStandby::battTimerFired);
@@ -1276,6 +1278,52 @@ static uint8_t kbcArm(uint8_t &before, uint8_t &after)
 
 // Lid (PNP0C0D) and sleep button (PNP0C0E): on ThinkPads their _PSW sets the EC's wake-on-lid-open / wake-on-Fn bits
 // and _PRW names the EC's wake GPE. macOS does not do this for Deep Idle, so the lid never wakes the machine.
+void S0ixStandby::setupIom()
+{
+	char buf[128] = "not found";
+	const IORegistryPlane *plane = IORegistryEntry::getPlane("IOACPIPlane");
+	OSString *nm = OSString::withCString("PC00");
+	IOACPIPlatformDevice *pc = nullptr;
+	if (plane && nm)
+		if (IORegistryIterator *it = IORegistryIterator::iterateOver(plane, kIORegistryIterateRecursively)) {
+			while (IORegistryEntry *e = it->getNextObject()) {
+				IOACPIPlatformDevice *d = OSDynamicCast(IOACPIPlatformDevice, e);
+				if (d && nm->isEqualTo(d->getName())) { pc = d; break; }
+			}
+			it->release();
+		}
+	OSSafeReleaseNULL(nm);
+	OSObject *r = nullptr;
+	uint64_t base = 0;
+	if (pc && pc->evaluateObject("IOMA", &r) == kIOReturnSuccess && r)
+		if (OSNumber *n = OSDynamicCast(OSNumber, r)) base = n->unsigned64BitValue();
+	OSSafeReleaseNULL(r);
+	if (base) {
+		uint64_t a = base + 0xC10000 + 0x40;
+		if (IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(a & ~0xFFFULL, 0x1000, kIODirectionInOut)) {
+			iomMap = md->map(kIOMapInhibitCache);
+			md->release();
+			if (iomMap) iomReg = reinterpret_cast<volatile uint32_t *>(iomMap->getVirtualAddress() + (a & 0xFFF));
+		}
+		snprintf(buf, sizeof(buf), "IOM+0x40 at 0x%llx = 0x%08x (TD3C b15, TACK b16, DPOF b17)%s", (unsigned long long)a,
+		         iomReg ? *iomReg : 0xFFFFFFFF, iomNoDpof ? "; -s0ixnodpof: DPOF cleared after the entry _DSM" : "");
+	}
+	setProperty("Type-C IOM", buf);
+	LOG("Type-C IOM %s", buf);
+	if (iomReg && !iomCall) iomCall = thread_call_allocate(iomLater, this);
+}
+
+void S0ixStandby::iomLater(thread_call_param_t self, thread_call_param_t)
+{
+	S0ixStandby *me = static_cast<S0ixStandby *>(self);
+	if (!me->iomReg) return;
+	me->iomV[4] = *me->iomReg;
+	char b[160];
+	snprintf(b, sizeof(b), "before entry 0x%08x, after entry 0x%08x, wake before exit 0x%08x, after exit 0x%08x, +2 s 0x%08x",
+	         me->iomV[0], me->iomV[1], me->iomV[2], me->iomV[3], me->iomV[4]);
+	me->setProperty("Type-C IOM at last sleep", b);
+}
+
 void S0ixStandby::setupLidWake()
 {
 	setProperty("Keyboard wake", kbWake ? "armed during Deep Idle when the lid is open (-s0ixkbdwake): i8042 keyboard port + IRQ1"
@@ -1632,7 +1680,12 @@ void S0ixStandby::onSleep()
 	entered = false;
 	if (dsmEnabled && lastSleepType == kSleepTypeDeepIdle &&
 	    (dsmMask[kIntel] || dsmMask[kMicrosoft] || dsmMask[kAMD])) {
+		if (iomReg) iomV[0] = *iomReg;
 		dsmEntry();
+		if (iomReg) {
+			if (iomNoDpof && (*iomReg & (1u << 17))) *iomReg = *iomReg & ~(1u << 17);
+			iomV[1] = *iomReg;
+		}
 		entered = true;
 	}
 	// Last step: nothing after us may touch PM1_EN before the halt.
@@ -1766,7 +1819,12 @@ void S0ixStandby::onWake()
 		}
 	}
 	if (entered) {
+		if (iomReg) iomV[2] = *iomReg;
 		dsmExit();
+		if (iomReg) {
+			iomV[3] = *iomReg;
+			if (iomCall) { uint64_t dl; clock_interval_to_deadline(2000, kMillisecondScale, &dl); thread_call_enter_delayed(iomCall, dl); }
+		}
 		entered = false;
 	}
 	if (lwWake && lastSleepType == kSleepTypeDeepIdle) lidPsw(false);

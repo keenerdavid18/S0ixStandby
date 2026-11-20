@@ -275,6 +275,14 @@ private:
 	bool sciUnmasked {false};
 	thread_call_t edCall {nullptr};
 	static void edReplay(thread_call_param_t self, thread_call_param_t);
+	// Type-C IOM (REGBAR + 0xC10000): DPOF ("all monitors off", set by the LPS0 entry _DSM), TD3C, TACK.
+	bool iomNoDpof {false};
+	IOMemoryMap *iomMap {nullptr};
+	volatile uint32_t *iomReg {nullptr};          // IOM + 0x40
+	uint32_t iomV[5] {};                          // before entry, after entry(+fix), wake before exit, after exit, +2 s
+	thread_call_t iomCall {nullptr};
+	void setupIom();
+	static void iomLater(thread_call_param_t self, thread_call_param_t);
 	void setupLidWake();
 	void lidPsw(bool on);
 	thread_call_t pbCall {nullptr};
