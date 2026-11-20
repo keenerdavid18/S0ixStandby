@@ -1524,6 +1524,13 @@ void S0ixStandby::iomLater(thread_call_param_t self, thread_call_param_t)
 			n += snprintf(t + n, sizeof(t) - n, " %02x:%02x.%x D%u%s", me->nvDev[i]->getBusNumber(), me->nvDev[i]->getDeviceNumber(),
 			              me->nvDev[i]->getFunctionNumber(), me->nvSaved[i] & 3, me->nvChanged[i] ? (me->nvAfter[i] & 3) == 0 ? "->D0" : "->D0 FAILED" : "");
 		me->setProperty("NVMe at last sleep", t);
+		char l[600]; size_t m = 0;
+		for (uint32_t i = 0; i < me->nvN && m < sizeof(l) - 120; i++)
+			m += snprintf(l + m, sizeof(l) - m, "%s%02x:%02x.%x lnkctl %x/%x/%x devctl2 %x/%x/%x l1ss %x/%x/%x ltr %x/%x/%x", m ? "; " : "",
+			              me->nvDev[i]->getBusNumber(), me->nvDev[i]->getDeviceNumber(), me->nvDev[i]->getFunctionNumber(),
+			              me->nvLnk[i][0], me->nvLnk[i][1], me->nvLnk[i][2], me->nvDc2[i][0], me->nvDc2[i][1], me->nvDc2[i][2],
+			              me->nvSs1[i][0], me->nvSs1[i][1], me->nvSs1[i][2], me->nvLtrV[i][0], me->nvLtrV[i][1], me->nvLtrV[i][2]);
+		me->setProperty("NVMe link config (saved/after D0/restored)", l);
 	}
 	if (me->nobmMask) {
 		char t[200];
@@ -1564,17 +1571,44 @@ void S0ixStandby::nvmeSleep()
 		it->release();
 		for (uint32_t i = 0; i < nr; i++) { rp[i]->retain(); nvDev[nvN++] = rp[i]; }
 		for (uint32_t i = 0; i < ne; i++) { ep[i]->retain(); nvDev[nvN++] = ep[i]; }
-		for (uint32_t i = 0; i < nvN; i++) { uint8_t pm = 0; nvDev[i]->findPCICapability(kIOPCIPowerManagementCapability, &pm); nvPm[i] = pm; }
+		for (uint32_t i = 0; i < nvN; i++) {
+			uint8_t pm = 0, ex = 0; IOByteCount o = 0;
+			nvDev[i]->findPCICapability(kIOPCIPowerManagementCapability, &pm); nvPm[i] = pm;
+			nvDev[i]->findPCICapability(kIOPCIPCIExpressCapability, &ex); nvExp[i] = ex;
+			o = 0; if (nvDev[i]->extendedFindPCICapability(kIOPCIExpressCapabilityIDL1PMSubstates, &o)) nvL1ss[i] = (uint16_t)o;
+			o = 0; if (nvDev[i]->extendedFindPCICapability(kIOPCIExpressCapabilityIDLatencyTolerenceReporting, &o)) nvLtr[i] = (uint16_t)o;
+		}
 	}
 	for (uint32_t i = 0; i < nvN; i++) {
 		nvChanged[i] = false;
 		nvSaved[i] = nvPm[i] ? nvDev[i]->configRead16(nvPm[i] + 4) : 0;
 		nvAfter[i] = nvSaved[i];
+		IOPCIDevice *d = nvDev[i];
+		auto snap = [&](int k) {
+			if (nvExp[i]) { nvLnk[i][k] = d->configRead16(nvExp[i] + 0x10); nvDc2[i][k] = d->configRead16(nvExp[i] + 0x28); }
+			if (nvL1ss[i]) nvSs1[i][k] = d->configRead32(nvL1ss[i] + 8);
+			if (nvLtr[i]) nvLtrV[i][k] = d->configRead32(nvLtr[i] + 4);
+		};
+		snap(0);
+		if (nvL1ss[i]) nvSs2[i] = d->configRead32(nvL1ss[i] + 0xC);
+		snap(1); snap(2);
 		if (nvmeD0 && nvPm[i] && (nvSaved[i] & 3) && nvSaved[i] != 0xFFFF) {
-			nvDev[i]->configWrite16(nvPm[i] + 4, (uint16_t)(nvSaved[i] & ~3));
+			d->configWrite16(nvPm[i] + 4, (uint16_t)(nvSaved[i] & ~3));
 			IODelay(10000);                                   // D3hot -> D0: 10 ms
-			nvAfter[i] = nvDev[i]->configRead16(nvPm[i] + 4);
+			nvAfter[i] = d->configRead16(nvPm[i] + 4);
 			nvChanged[i] = true;
+			snap(1);
+			// restore what the D3hot -> D0 reset lost: LTR enable + values, L1SS (CTL2, CTL1), ASPM last (PCIe spec order)
+			if (nvExp[i] && nvDc2[i][1] != nvDc2[i][0]) d->configWrite16(nvExp[i] + 0x28, nvDc2[i][0]);
+			if (nvLtr[i] && nvLtrV[i][1] != nvLtrV[i][0]) d->configWrite32(nvLtr[i] + 4, nvLtrV[i][0]);
+			if (nvL1ss[i] && nvSs1[i][1] != nvSs1[i][0]) {
+				if (nvExp[i]) d->configWrite16(nvExp[i] + 0x10, (uint16_t)(d->configRead16(nvExp[i] + 0x10) & ~3));
+				d->configWrite32(nvL1ss[i] + 0xC, nvSs2[i]);
+				d->configWrite32(nvL1ss[i] + 8, nvSs1[i][0]);
+			}
+			if (nvExp[i] && (d->configRead16(nvExp[i] + 0x10) & 0x3) != (nvLnk[i][0] & 0x3))
+				d->configWrite16(nvExp[i] + 0x10, (uint16_t)((d->configRead16(nvExp[i] + 0x10) & ~0x3) | (nvLnk[i][0] & 0x3)));
+			snap(2);
 		}
 	}
 }

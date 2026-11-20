@@ -315,6 +315,10 @@ private:
 	uint8_t nvPm[kNvMax] {};
 	uint16_t nvSaved[kNvMax] {}, nvAfter[kNvMax] {};
 	bool nvChanged[kNvMax] {};
+	// PCIe link power config of each function (a D3hot -> D0 transition can reset it): PCIe cap, L1SS ext cap, LTR ext cap
+	uint16_t nvExp[kNvMax] {}, nvL1ss[kNvMax] {}, nvLtr[kNvMax] {};
+	uint16_t nvLnk[kNvMax][3] {}, nvDc2[kNvMax][3] {};      // [0] saved, [1] after D0, [2] after restore
+	uint32_t nvSs1[kNvMax][3] {}, nvSs2[kNvMax] {}, nvLtrV[kNvMax][3] {};
 	uint32_t nvN {0}, nvCount {0};
 	void nvmeSleep();
 	void nvmeWake();
