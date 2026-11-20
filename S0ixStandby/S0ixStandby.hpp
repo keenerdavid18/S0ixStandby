@@ -256,6 +256,10 @@ private:
 	volatile bool kbWoke {false};
 	uint8_t kbCfgBefore {0}, kbCfgSet {0}, kbStsAtWake {0}, kbArmResult {0};
 	uint32_t kbWakeCount {0};
+	IOMemoryMap *ioapicMap {nullptr};
+	volatile uint32_t *ioapic {nullptr};
+	uint32_t kbRteLow {0}, kbRteHigh {0};
+	bool kbRteUnmasked {false};
 	void setupLidWake();
 	void lidPsw(bool on);
 	thread_call_t pbCall {nullptr};

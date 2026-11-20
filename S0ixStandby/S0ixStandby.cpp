@@ -1023,6 +1023,15 @@ IOReturn S0ixStandby::callPlatformFunction(const OSSymbol *functionName, bool wa
 		if (functionName->isEqualTo("IOPlatformQuiesceAction")) {
 			if (rtcBlocked) outw(pm1EnPort, (uint16_t)(inw(pm1EnPort) & ~kPm1RtcEn));
 			if (kbArm) kbArmResult = kbcArm(kbCfgBefore, kbCfgSet);
+			kbRteUnmasked = false;
+			if (kbArm && kbArmResult == 1 && ioapic) {
+				ioapic[0] = 0x12; kbRteLow = ioapic[4];            // redirection entry for GSI 1 (IRQ1), low dword
+				ioapic[0] = 0x13; kbRteHigh = ioapic[4];
+				if (kbRteLow & 0x10000) {                          // masked by the PS/2 driver for sleep
+					ioapic[0] = 0x12; ioapic[4] = kbRteLow & ~0x10000u;
+					kbRteUnmasked = true;
+				}
+			}
 			if (lwArm && lwGpe != 0xFFFFFFFF) lwEnReadback = gpeEnSet(gpe0EnPort, lwGpe);
 			if (pbArm) {
 				// The laptop reports its power button through the EC (FADT control-method button), so the OS
@@ -1076,6 +1085,7 @@ IOReturn S0ixStandby::callPlatformFunction(const OSSymbol *functionName, bool wa
 				if (lwArm && lwGpe != 0xFFFFFFFF && (gpe0StsAtWake[lwGpe / 8] >> (lwGpe % 8) & 1)) lwWoke = true;
 				if (kbArm) {
 					kbStsAtWake = inb(0x64);
+					if (kbRteUnmasked && ioapic) { ioapic[0] = 0x12; ioapic[4] = kbRteLow; kbRteUnmasked = false; }
 					if (kbArmResult == 1 && (kbStsAtWake & 0x21) == 0x01) kbWoke = true;   // keyboard byte waiting
 				}
 			}
@@ -1217,6 +1227,19 @@ void S0ixStandby::setupLidWake()
 {
 	setProperty("Keyboard wake", kbWake ? "armed during Deep Idle when the lid is open (-s0ixkbdwake): i8042 keyboard port + IRQ1"
 	                                    : "off (boot-arg -s0ixkbdwake)");
+	if (kbWake && !ioapic) {
+		// MADT on this machine: one I/O APIC at 0xFEC00000, no source override for IRQ1 (GSI 1).
+		if (IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(0xFEC00000ULL, 0x1000, kIODirectionInOut)) {
+			ioapicMap = md->map(kIOMapInhibitCache);
+			md->release();
+			if (ioapicMap) {
+				ioapic = reinterpret_cast<volatile uint32_t *>(ioapicMap->getVirtualAddress());
+				ioapic[0] = 0x01;                               // IOAPICVER: sanity check
+				uint32_t ver = ioapic[4];
+				if ((ver & 0xFF) < 0x11 || ((ver >> 16) & 0xFF) < 1) { ioapic = nullptr; OSSafeReleaseNULL(ioapicMap); }
+			}
+		}
+	}
 	if (!lwWake && !kbWake) { setProperty("Lid wake", "off (boot-arg -s0ixlidwake)"); return; }
 	static const char *hids[2] = { "PNP0C0D", "PNP0C0E" };
 	const IORegistryPlane *plane = IORegistryEntry::getPlane("IOACPIPlane");
@@ -1552,9 +1575,10 @@ void S0ixStandby::onWake()
 	if (wakeInfoValid && ecGpe != 0xFFFFFFFF && (gpe0StsAtWake[ecGpe / 8] >> (ecGpe % 8) & 1))
 		ecWakeCount++;
 	if (kbWake) {
-		char kb[96];
-		snprintf(kb, sizeof(kb), "%s, arm result %u, command byte 0x%02x -> 0x%02x, status at wake 0x%02x",
-		         kbArm ? "armed" : "not armed (lid closed)", kbArmResult, kbCfgBefore, kbCfgSet, kbStsAtWake);
+		char kb[160];
+		snprintf(kb, sizeof(kb), "%s, arm result %u, command byte 0x%02x -> 0x%02x, status at wake 0x%02x, IRQ1 RTE 0x%08x:%08x%s",
+		         kbArm ? "armed" : "not armed (lid closed)", kbArmResult, kbCfgBefore, kbCfgSet, kbStsAtWake,
+		         kbRteHigh, kbRteLow, ioapic ? "" : " (no IOAPIC map)");
 		setProperty("Keyboard at last sleep", kb);
 	}
 	if (kbWoke) {
