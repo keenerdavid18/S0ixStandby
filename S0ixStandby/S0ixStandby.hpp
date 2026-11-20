@@ -13,6 +13,7 @@
 #define S0IXSTANDBY_HPP
 
 #include <IOKit/IOService.h>
+#include <kern/thread_call.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -237,6 +238,14 @@ private:
 	// Wake sources (read-only by default) and -s0ixecwake: keep the EC's
 	// GPE armed during Deep Idle so lid open (EC query) can wake.
 	bool ecWake {false}, ecArm {false}, ecArmed {false}, wakeInfoValid {false};
+	// -s0ixpwrbtn: PM1 fixed power-button event as a Deep Idle wake source (control-method power button laptops).
+	bool pbWake {false}, pbArm {false}, pbArmed {false};
+	volatile bool pbWoke {false};
+	uint16_t pbEnPort {0};
+	uint32_t pbWakeCount {0};
+	uint32_t pbTickles {0};
+	thread_call_t pbCall {nullptr};
+	static void pbUserActive(thread_call_param_t self, thread_call_param_t);
 	uint16_t pm1StsPort {0}, gpe0StsPort {0}, gpe0EnPort {0};
 	uint8_t gpe0Half {0};                  // bytes in each of the status/enable halves
 	uint32_t ecGpe {0xFFFFFFFF};           // EC _GPE number, if a GPE0 bit

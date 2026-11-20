@@ -157,6 +157,7 @@ static const uint32_t kActionPriority = 0x8000;
 
 static const uint32_t kSleepTypeDeepIdle = 7;   // kIOPMSleepTypeDeepIdle
 static const uint16_t kPm1RtcEn = 1u << 10;      // PM1_EN.RTC_EN (ACPI fixed event)
+static const uint16_t kPm1PwrBtn = 1u << 8;       // PM1_STS.PWRBTN_STS / PM1_EN.PWRBTN_EN
 static const uint8_t  kCmosAie  = 1u << 5;       // RTC register B: alarm interrupt enable
 static inline uint8_t cmosRead(uint8_t reg) { outb(0x70, reg); return inb(0x71); }
 static inline void cmosWrite(uint8_t reg, uint8_t v) { outb(0x70, reg); outb(0x71, v); }
@@ -308,6 +309,7 @@ bool S0ixStandby::start(IOService *provider)
 	refclkWA = bootArg("-s0ixrefclk");
 	acNoRtc = bootArg("-s0ixacnortc");
 	ecWake = bootArg("-s0ixecwake");
+	pbWake = bootArg("-s0ixpwrbtn");
 	uint32_t fn = 0;
 	if (PE_parse_boot_argn("s0ixfn", &fn, sizeof(fn)))
 		fnAllow = fn;
@@ -1008,6 +1010,14 @@ IOReturn S0ixStandby::callPlatformFunction(const OSSymbol *functionName, bool wa
 		// Interrupts are disabled in these two: MSR reads only, no locks/logging.
 		if (functionName->isEqualTo("IOPlatformQuiesceAction")) {
 			if (rtcBlocked) outw(pm1EnPort, (uint16_t)(inw(pm1EnPort) & ~kPm1RtcEn));
+			if (pbArm) {
+				// The laptop reports its power button through the EC (FADT control-method button), so the OS
+				// never enables the PCH's fixed PWRBTN event; the EC is in standby and does not deliver the
+				// press. The PCH still latches PWRBTN_STS: enable it for the halt only.
+				outw(pm1StsPort, kPm1PwrBtn);                               // drop a stale press (write 1 to clear)
+				outw(pbEnPort, (uint16_t)(inw(pbEnPort) | kPm1PwrBtn));
+				pbArmed = true;
+			}
 			if (ecArm) {
 				// Last thing before the halt: macOS has set up its wake GPEs.
 				uint16_t p = (uint16_t)(gpe0EnPort + ecGpe / 8);
@@ -1035,6 +1045,11 @@ IOReturn S0ixStandby::callPlatformFunction(const OSSymbol *functionName, bool wa
 			if (gpe0StsPort) {
 				// What woke the CPU: status bits are still set here (cleared later by ACPI).
 				pm1StsAtWake = pm1StsPort ? inw(pm1StsPort) : 0;
+				if (pbArmed) {
+					outw(pbEnPort, (uint16_t)(inw(pbEnPort) & ~kPm1PwrBtn));   // never leave it on: nobody handles it awake
+					if (pm1StsAtWake & kPm1PwrBtn) { outw(pm1StsPort, kPm1PwrBtn); pbWoke = true; }
+					pbArmed = false;
+				}
 				for (uint32_t i = 0; i < gpe0Half && i < sizeof(gpe0StsAtWake); i++)
 					gpe0StsAtWake[i] = inb((uint16_t)(gpe0StsPort + i));
 				wakeInfoValid = true;
@@ -1117,6 +1132,17 @@ void S0ixStandby::setupWakeInfo()
 	if (len >= 232 && f[220] == 1 && OSReadLittleInt64(f, 224))   // X_GPE0_BLK, SystemIO
 		gpe = OSReadLittleInt64(f, 224);
 	if (pm1 && pm1 < 0xFFFF) pm1StsPort = (uint16_t)pm1;
+	{
+		uint8_t evtLen = f[88];                                   // PM1_EVT_LEN
+		if (pm1StsPort && evtLen >= 4 && pm1 + evtLen / 2 < 0xFFFF) pbEnPort = (uint16_t)(pm1 + evtLen / 2);
+		char pb[96];
+		if (!pbWake) snprintf(pb, sizeof(pb), "off (boot-arg -s0ixpwrbtn)");
+		else if (pbEnPort) snprintf(pb, sizeof(pb), "armed during Deep Idle (-s0ixpwrbtn): PM1_EN at I/O 0x%x bit 8", pbEnPort);
+		else snprintf(pb, sizeof(pb), "unavailable: no PM1 event block");
+		setProperty("Power button wake", pb);
+		LOG("Power button wake %s", pb);
+		if (pbWake && pbEnPort && !pbCall) pbCall = thread_call_allocate(pbUserActive, this);
+	}
 	if (gpe && gpe + gpeLen <= 0xFFFF && gpeLen >= 2 && !(gpeLen & 1)) {
 		gpe0StsPort = (uint16_t)gpe;
 		gpe0Half = gpeLen / 2;
@@ -1355,10 +1381,31 @@ void S0ixStandby::onSleep()
 		rtcBlocked = true;
 	}
 	ecArm = ecWake && gpe0EnPort && ecGpe != 0xFFFFFFFF && lastSleepType == kSleepTypeDeepIdle;
+	pbArm = pbWake && pbEnPort && pm1StsPort && gpe0StsPort && lastSleepType == kSleepTypeDeepIdle;
+	pbArmed = false; pbWoke = false;
 	ecArmed = false;
 	wakeInfoValid = false;
 	DBG("sleep: type %u, dsm %s, counter %llu, rtc wake %s", lastSleepType, entered ? "entry" : "skipped",
 	    counterAtSleep, rtcBlocked ? "blocked (AC)" : "allowed");
+}
+
+void S0ixStandby::pbUserActive(thread_call_param_t self, thread_call_param_t)
+{
+	// Same call the HID system makes on user input: in a dark wake the root domain turns it into a full wake
+	// ("Requesting full wake due to dark wake activity tickle").
+	S0ixStandby *me = static_cast<S0ixStandby *>(self);
+	if (OSDictionary *m = IOService::serviceMatching("IODisplayWrangler")) {
+		if (IOService *w = IOService::copyMatchingService(m)) {
+			w->activityTickle(0, 0);
+			w->release();
+		}
+		m->release();
+	}
+	// Once more a little later, in case the first one came before the wrangler was ready.
+	if (me->pbTickles++ < 1 && me->pbCall) {
+		uint64_t dl; clock_interval_to_deadline(1200, kMillisecondScale, &dl);
+		thread_call_enter_delayed(me->pbCall, dl);
+	}
 }
 
 void S0ixStandby::onWake()
@@ -1378,6 +1425,18 @@ void S0ixStandby::onWake()
 	ecArmed = false;
 	if (wakeInfoValid && ecGpe != 0xFFFFFFFF && (gpe0StsAtWake[ecGpe / 8] >> (ecGpe % 8) & 1))
 		ecWakeCount++;
+	if (pbWoke) {
+		// macOS sees no wake reason and would stay in dark wake and sleep again: ask for a full (user) wake
+		// once the wake transition is under way.
+		pbWoke = false;
+		pbWakeCount++;
+		setProperty("Power button wakes", (unsigned long long)pbWakeCount, 32);
+		pbTickles = 0;
+		if (pbCall) {
+			uint64_t dl; clock_interval_to_deadline(300, kMillisecondScale, &dl);
+			thread_call_enter_delayed(pbCall, dl);
+		}
+	}
 	if (entered) {
 		dsmExit();
 		entered = false;
