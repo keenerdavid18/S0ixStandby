@@ -158,6 +158,7 @@ static const uint32_t kActionPriority = 0x8000;
 static const uint32_t kSleepTypeDeepIdle = 7;   // kIOPMSleepTypeDeepIdle
 static const uint16_t kPm1RtcEn = 1u << 10;      // PM1_EN.RTC_EN (ACPI fixed event)
 static const uint16_t kPm1PwrBtn = 1u << 8;       // PM1_STS.PWRBTN_STS / PM1_EN.PWRBTN_EN
+static uint8_t kbcArm(uint8_t &before, uint8_t &after);
 static const uint8_t  kCmosAie  = 1u << 5;       // RTC register B: alarm interrupt enable
 static inline uint8_t cmosRead(uint8_t reg) { outb(0x70, reg); return inb(0x71); }
 static inline void cmosWrite(uint8_t reg, uint8_t v) { outb(0x70, reg); outb(0x71, v); }
@@ -311,6 +312,7 @@ bool S0ixStandby::start(IOService *provider)
 	ecWake = bootArg("-s0ixecwake");
 	pbWake = bootArg("-s0ixpwrbtn");
 	lwWake = bootArg("-s0ixlidwake");
+	kbWake = bootArg("-s0ixkbdwake");
 	uint32_t fn = 0;
 	if (PE_parse_boot_argn("s0ixfn", &fn, sizeof(fn)))
 		fnAllow = fn;
@@ -1012,6 +1014,7 @@ IOReturn S0ixStandby::callPlatformFunction(const OSSymbol *functionName, bool wa
 		// Interrupts are disabled in these two: MSR reads only, no locks/logging.
 		if (functionName->isEqualTo("IOPlatformQuiesceAction")) {
 			if (rtcBlocked) outw(pm1EnPort, (uint16_t)(inw(pm1EnPort) & ~kPm1RtcEn));
+			if (kbArm) kbArmResult = kbcArm(kbCfgBefore, kbCfgSet);
 			if (lwArm && lwGpe != 0xFFFFFFFF) {
 				uint16_t p = (uint16_t)(gpe0EnPort + lwGpe / 8);
 				uint8_t m = (uint8_t)(1u << (lwGpe % 8)), v = inb(p);
@@ -1064,6 +1067,10 @@ IOReturn S0ixStandby::callPlatformFunction(const OSSymbol *functionName, bool wa
 					gpe0StsAtWake[i] = inb((uint16_t)(gpe0StsPort + i));
 				wakeInfoValid = true;
 				if (lwArm && lwGpe != 0xFFFFFFFF && (gpe0StsAtWake[lwGpe / 8] >> (lwGpe % 8) & 1)) lwWoke = true;
+				if (kbArm) {
+					kbStsAtWake = inb(0x64);
+					if (kbArmResult == 1 && (kbStsAtWake & 0x21) == 0x01) kbWoke = true;   // keyboard byte waiting
+				}
 			}
 			if (pmcDump && counterPage && pmcHaltValid) {
 				for (uint32_t i = 0; i < 1024; i++) pmcAtActive[i] = counterPage[i];
@@ -1168,11 +1175,42 @@ void S0ixStandby::setupWakeInfo()
 // The EC's GPE number: s0ixecgpe=N overrides; otherwise _GPE of the PNP0C09
 // device, searched in the ACPI plane (the EC nub isn't always registered yet,
 // or at all). An integer is a GPE0 bit; a package means a GPE block device.
+// i8042 at the quiesce action (interrupts off, the PS/2 driver has already put the controller to sleep with the
+// keyboard clock and IRQ disabled): turn the keyboard interface and its interrupt back on so a key press raises
+// IRQ1 and ends the halt. The PS/2 driver re-initialises the controller on wake.
+static bool kbcWait(uint8_t mask, uint8_t want)
+{
+	for (int i = 0; i < 2000; i++) {                      // up to ~20 ms
+		if ((inb(0x64) & mask) == want) return true;
+		IODelay(10);
+	}
+	return false;
+}
+static uint8_t kbcArm(uint8_t &before, uint8_t &after)
+{
+	if (inb(0x64) == 0xFF) return 2;                      // no controller
+	if (!kbcWait(0x02, 0)) return 3;
+	outb(0x64, 0xAE);                                     // enable the keyboard interface
+	for (int i = 0; i < 16 && (inb(0x64) & 0x01); i++) { (void)inb(0x60); IODelay(50); }   // drop stale bytes
+	if (!kbcWait(0x02, 0)) return 3;
+	outb(0x64, 0x20);                                     // read the command byte
+	if (!kbcWait(0x01, 0x01)) return 4;
+	before = inb(0x60);
+	after = (uint8_t)((before | 0x01) & ~0x10);           // keyboard IRQ on, keyboard clock not disabled
+	if (!kbcWait(0x02, 0)) return 3;
+	outb(0x64, 0x60);
+	if (!kbcWait(0x02, 0)) return 3;
+	outb(0x60, after);
+	return 1;
+}
+
 // Lid (PNP0C0D) and sleep button (PNP0C0E): on ThinkPads their _PSW sets the EC's wake-on-lid-open / wake-on-Fn bits
 // and _PRW names the EC's wake GPE. macOS does not do this for Deep Idle, so the lid never wakes the machine.
 void S0ixStandby::setupLidWake()
 {
-	if (!lwWake) { setProperty("Lid wake", "off (boot-arg -s0ixlidwake)"); return; }
+	setProperty("Keyboard wake", kbWake ? "armed during Deep Idle when the lid is open (-s0ixkbdwake): i8042 keyboard port + IRQ1"
+	                                    : "off (boot-arg -s0ixkbdwake)");
+	if (!lwWake && !kbWake) { setProperty("Lid wake", "off (boot-arg -s0ixlidwake)"); return; }
 	static const char *hids[2] = { "PNP0C0D", "PNP0C0E" };
 	const IORegistryPlane *plane = IORegistryEntry::getPlane("IOACPIPlane");
 	if (!plane) return;
@@ -1200,7 +1238,8 @@ void S0ixStandby::setupLidWake()
 	}
 	if (lwGpe != 0xFFFFFFFF && (!gpe0EnPort || lwGpe / 8 >= gpe0Half)) lwGpe = 0xFFFFFFFF;
 	char buf[128];
-	snprintf(buf, sizeof(buf), "armed during Deep Idle (-s0ixlidwake): lid %s, sleep button %s, wake GPE 0x%x",
+	snprintf(buf, sizeof(buf), "%s: lid %s, sleep button %s, wake GPE 0x%x",
+	         lwWake ? "armed during Deep Idle (-s0ixlidwake)" : "off (boot-arg -s0ixlidwake)",
 	         lwDev[0] ? lwDev[0]->getName() : "not found", lwDev[1] ? lwDev[1]->getName() : "not found", lwGpe);
 	setProperty("Lid wake", buf);
 	LOG("Lid wake %s", buf);
@@ -1453,6 +1492,12 @@ void S0ixStandby::onSleep()
 	pbArm = pbWake && pbEnPort && pm1StsPort && gpe0StsPort && lastSleepType == kSleepTypeDeepIdle;
 	lwArm = lwWake && (lwDev[0] || lwDev[1]) && lastSleepType == kSleepTypeDeepIdle;
 	lwWoke = false;
+	kbArm = false; kbWoke = false; kbArmResult = 0; kbStsAtWake = 0;
+	if (kbWake && lastSleepType == kSleepTypeDeepIdle) {
+		UInt32 open = 1;                                   // no lid device: treat as open
+		if (lwDev[0] && lwDev[0]->evaluateInteger("_LID", &open) != kIOReturnSuccess) open = 1;
+		kbArm = open != 0;
+	}
 	pbArmed = false; pbWoke = false;
 	ecArmed = false;
 	wakeInfoValid = false;
@@ -1496,6 +1541,22 @@ void S0ixStandby::onWake()
 	ecArmed = false;
 	if (wakeInfoValid && ecGpe != 0xFFFFFFFF && (gpe0StsAtWake[ecGpe / 8] >> (ecGpe % 8) & 1))
 		ecWakeCount++;
+	if (kbWake) {
+		char kb[96];
+		snprintf(kb, sizeof(kb), "%s, arm result %u, command byte 0x%02x -> 0x%02x, status at wake 0x%02x",
+		         kbArm ? "armed" : "not armed (lid closed)", kbArmResult, kbCfgBefore, kbCfgSet, kbStsAtWake);
+		setProperty("Keyboard at last sleep", kb);
+	}
+	if (kbWoke) {
+		kbWoke = false;
+		kbWakeCount++;
+		setProperty("Keyboard wakes", (unsigned long long)kbWakeCount, 32);
+		pbTickles = 0;
+		if (pbCall) {
+			uint64_t dl; clock_interval_to_deadline(300, kMillisecondScale, &dl);
+			thread_call_enter_delayed(pbCall, dl);
+		}
+	}
 	if (lwWoke) {
 		lwWoke = false;
 		lwWakeCount++;
