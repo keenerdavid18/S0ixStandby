@@ -17,6 +17,7 @@
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
 #include <IOKit/pci/IOPCIDevice.h>
 
@@ -322,6 +323,18 @@ private:
 	uint32_t nvN {0}, nvCount {0};
 	void nvmeSleep();
 	void nvmeWake();
+	// -s0ixnvmeps (with -s0ixnvmed0): like Linux nvme_suspend with nvme.noacpi=1 - for the halt, bring each drive's
+	// controller up with a private admin queue and Set Features (Power Management) to its deepest non-operational
+	// power state; at wake reset the controller (CC.EN=0) before macOS's NVMe driver re-initialises it.
+	bool nvmePs {false};
+	IOMemoryMap *nvBar[kNvMax] {};
+	IOBufferMemoryDescriptor *nvBuf[kNvMax] {};          // 3 pages: SQ, CQ, identify data
+	uint16_t nvCmdSaved[kNvMax] {};
+	bool nvCtrlUp[kNvMax] {};
+	char nvPsInfo[kNvMax][96] {};
+	bool nvmeCtrlPs(uint32_t i);
+	void nvmePrep();
+	void nvmeCtrlReset(uint32_t i);
 	uint64_t smiLast {0}, smiTscLast {0};
 	static void iomLater(thread_call_param_t self, thread_call_param_t);
 	void setupLidWake();

@@ -437,6 +437,7 @@ bool S0ixStandby::start(IOService *provider)
 	iomNoDpof = bootArg("-s0ixnodpof");
 	tcssD3 = bootArg("-s0ixtcssd3");
 	nvmeD0 = bootArg("-s0ixnvmed0");
+	nvmePs = nvmeD0 && bootArg("-s0ixnvmeps");
 	{ uint32_t m = 0; if (PE_parse_boot_argn("s0ixnobm", &m, sizeof(m))) nobmMask = m; }
 	uint32_t fn = 0;
 	if (PE_parse_boot_argn("s0ixfn", &fn, sizeof(fn)))
@@ -1531,6 +1532,12 @@ void S0ixStandby::iomLater(thread_call_param_t self, thread_call_param_t)
 			              me->nvLnk[i][0], me->nvLnk[i][1], me->nvLnk[i][2], me->nvDc2[i][0], me->nvDc2[i][1], me->nvDc2[i][2],
 			              me->nvSs1[i][0], me->nvSs1[i][1], me->nvSs1[i][2], me->nvLtrV[i][0], me->nvLtrV[i][1], me->nvLtrV[i][2]);
 		me->setProperty("NVMe link config (saved/after D0/restored)", l);
+		if (me->nvmePs) {
+			char q[400]; size_t k = 0;
+			for (uint32_t i = 0; i < me->nvN && k < sizeof(q) - 100; i++)
+				if (me->nvPsInfo[i][0]) k += snprintf(q + k, sizeof(q) - k, "%s%02x:00.0 %s", k ? "; " : "", me->nvDev[i]->getBusNumber(), me->nvPsInfo[i]);
+			me->setProperty("NVMe power state at last sleep", k ? q : "not attempted");
+		}
 	}
 	if (me->nobmMask) {
 		char t[200];
@@ -1553,7 +1560,9 @@ void S0ixStandby::iomLater(thread_call_param_t self, thread_call_param_t)
 // TD3C bit when no TCSS device asks to skip D3cold, _ON (TCON) clears it and waits for TACK. macOS never does ACPI
 // runtime D3 for these devices, so TD3C stayed 0 in every Deep Idle and the package never left PC2 once the IOM was
 // told the display is off (DPOF or DC9). Only with nothing attached to USB-C (never sleep docked).
-void S0ixStandby::nvmeSleep()
+// Called from the 60 s timer (normal thread context, system awake): find the devices and, for -s0ixnvmeps, allocate the
+// admin-queue DMA buffers and map BAR0 now - not in the sleep action.
+void S0ixStandby::nvmePrep()
 {
 	if (!nvN) {   // root ports 00:06.x first (parents), then the NVMe endpoints (class 01:08:02)
 		OSDictionary *match = serviceMatching("IOPCIDevice");
@@ -1579,6 +1588,22 @@ void S0ixStandby::nvmeSleep()
 			o = 0; if (nvDev[i]->extendedFindPCICapability(kIOPCIExpressCapabilityIDLatencyTolerenceReporting, &o)) nvLtr[i] = (uint16_t)o;
 		}
 	}
+	if (!nvmePs) return;
+	for (uint32_t i = 0; i < nvN; i++) {
+		if ((nvDev[i]->configRead32(kIOPCIConfigRevisionID) >> 8) != 0x010802) continue;
+		if (!nvBuf[i]) {
+			nvBuf[i] = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
+			                                                           3 * 4096, 0x00000000FFFFF000ULL);
+			if (nvBuf[i] && nvBuf[i]->prepare() != kIOReturnSuccess) OSSafeReleaseNULL(nvBuf[i]);
+		}
+		if (!nvBar[i] && nvDev[i]->configRead16(nvPm[i] + 4) != 0xFFFF && !(nvDev[i]->configRead16(nvPm[i] + 4) & 3))
+			nvBar[i] = nvDev[i]->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0, kIOMapInhibitCache);
+	}
+}
+
+void S0ixStandby::nvmeSleep()
+{
+	if (!nvN) { const bool ps = nvmePs; nvmePs = false; nvmePrep(); nvmePs = ps; }   // lookup only: no allocation here
 	for (uint32_t i = 0; i < nvN; i++) {
 		nvChanged[i] = false;
 		nvSaved[i] = nvPm[i] ? nvDev[i]->configRead16(nvPm[i] + 4) : 0;
@@ -1610,7 +1635,84 @@ void S0ixStandby::nvmeSleep()
 				d->configWrite16(nvExp[i] + 0x10, (uint16_t)((d->configRead16(nvExp[i] + 0x10) & ~0x3) | (nvLnk[i][0] & 0x3)));
 			snap(2);
 		}
+		nvCtrlUp[i] = false; nvPsInfo[i][0] = 0;
+		if (nvmePs && nvChanged[i] && (d->configRead32(kIOPCIConfigRevisionID) >> 8) == 0x010802) nvCtrlUp[i] = nvmeCtrlPs(i);
 	}
+}
+
+// Minimal NVMe admin path for the halt only (no I/O commands). Registers: CAP 0x0, CC 0x14, CSTS 0x1C, AQA 0x24,
+// ASQ 0x28, ACQ 0x30, doorbells 0x1000 (SQ0 tail) / 0x1000 + (4 << DSTRD) (CQ0 head).
+bool S0ixStandby::nvmeCtrlPs(uint32_t i)
+{
+	IOPCIDevice *d = nvDev[i];
+	auto info = [&](const char *msg) { snprintf(nvPsInfo[i], sizeof(nvPsInfo[i]), "%s", msg); };
+	if (!nvBuf[i] || !nvBar[i]) { info(!nvBuf[i] ? "no DMA buffer (not prepared)" : "BAR0 not mapped (not prepared)"); return false; }
+	nvCmdSaved[i] = d->configRead16(kIOPCIConfigCommand);
+	d->configWrite16(kIOPCIConfigCommand, (uint16_t)(nvCmdSaved[i] | kIOPCICommandMemorySpace | kIOPCICommandBusMaster));
+	volatile uint8_t *r = reinterpret_cast<volatile uint8_t *>(nvBar[i]->getVirtualAddress());
+	auto r32 = [&](uint32_t o) { return *reinterpret_cast<volatile uint32_t *>(r + o); };
+	auto w32 = [&](uint32_t o, uint32_t v) { *reinterpret_cast<volatile uint32_t *>(r + o) = v; };
+	auto w64 = [&](uint32_t o, uint64_t v) { w32(o, (uint32_t)v); w32(o + 4, (uint32_t)(v >> 32)); };
+	const uint64_t cap = (uint64_t)r32(0) | ((uint64_t)r32(4) << 32);
+	if (cap == ~0ULL || r32(0x1C) == 0xFFFFFFFF) { info("controller not responding"); d->configWrite16(kIOPCIConfigCommand, nvCmdSaved[i]); return false; }
+	const uint32_t toMs = (uint32_t)((cap >> 24) & 0xFF) * 500, dstrd = (uint32_t)((cap >> 32) & 0xF);
+	auto waitRdy = [&](uint32_t want) {
+		for (uint32_t t = 0; t < toMs + 500; t++) { const uint32_t st = r32(0x1C); if (st == 0xFFFFFFFF) return false; if ((st & 1) == want) return true; IODelay(1000); }
+		return false;
+	};
+	// reset (the driver left it shut down), then enable with our admin queues
+	w32(0x14, r32(0x14) & ~1u);
+	if (!waitRdy(0)) { info("reset timeout"); return false; }
+	uint8_t *mem = reinterpret_cast<uint8_t *>(nvBuf[i]->getBytesNoCopy());
+	bzero(mem, 3 * 4096);
+	const uint64_t pa = nvBuf[i]->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+	w32(0x24, (3u << 16) | 3u);                               // 4-entry admin SQ / CQ
+	w64(0x28, pa); w64(0x30, pa + 4096);
+	w32(0x14, (4u << 20) | (6u << 16) | 1u);                  // IOCQES 16 B, IOSQES 64 B, MPS 4 KB, NVM, EN
+	if (!waitRdy(1)) { info("enable timeout"); w32(0x14, 0); waitRdy(0); return false; }
+	uint32_t tail = 0;
+	auto admin = [&](uint8_t opc, uint16_t cid, uint64_t prp1, uint32_t c10, uint32_t c11, uint32_t &status) {
+		volatile uint32_t *sq = reinterpret_cast<volatile uint32_t *>(mem + tail * 64);
+		for (int k = 0; k < 16; k++) sq[k] = 0;
+		sq[0] = opc | ((uint32_t)cid << 16);
+		sq[6] = (uint32_t)prp1; sq[7] = (uint32_t)(prp1 >> 32);
+		sq[10] = c10; sq[11] = c11;
+		const uint32_t slot = tail;
+		tail = (tail + 1) & 3;
+		OSSynchronizeIO();
+		w32(0x1000, tail);
+		volatile uint32_t *cq = reinterpret_cast<volatile uint32_t *>(mem + 4096 + slot * 16);
+		for (int t = 0; t < 2000; t++) {
+			if (cq[3] & 0x10000) { status = (cq[3] >> 17) & 0x7FFF; w32(0x1000 + (4u << dstrd), tail); return true; }
+			IODelay(500);
+		}
+		return false;
+	};
+	uint32_t st = 0;
+	if (!admin(0x06, 1, pa + 8192, 1, 0, st) || st) {          // Identify Controller
+		snprintf(nvPsInfo[i], sizeof(nvPsInfo[i]), "identify failed (status 0x%x)", st); w32(0x14, 0); waitRdy(0); return false;
+	}
+	const uint8_t *id = mem + 8192;
+	const uint32_t npss = id[263];
+	int ps = -1;
+	for (int k = (int)npss; k >= 0; k--) if (id[2048 + 32 * k + 3] & 2) { ps = k; break; }   // deepest non-operational
+	if (ps < 0) ps = (int)npss;
+	if (!admin(0x09, 2, 0, 0x02, (uint32_t)ps, st) || st) {    // Set Features: Power Management
+		snprintf(nvPsInfo[i], sizeof(nvPsInfo[i]), "set PS%d failed (status 0x%x, npss %u)", ps, st, npss); w32(0x14, 0); waitRdy(0); return false;
+	}
+	snprintf(nvPsInfo[i], sizeof(nvPsInfo[i]), "PS%d of 0-%u (CAP.TO %u ms)", ps, npss, toMs);
+	return true;
+}
+
+void S0ixStandby::nvmeCtrlReset(uint32_t i)
+{
+	if (nvBar[i]) {
+		volatile uint32_t *cc = reinterpret_cast<volatile uint32_t *>(nvBar[i]->getVirtualAddress() + 0x14);
+		volatile uint32_t *csts = reinterpret_cast<volatile uint32_t *>(nvBar[i]->getVirtualAddress() + 0x1C);
+		*cc = *cc & ~1u;
+		for (int t = 0; t < 2000 && *csts != 0xFFFFFFFF && (*csts & 1); t++) IODelay(1000);
+	}
+	nvDev[i]->configWrite16(kIOPCIConfigCommand, nvCmdSaved[i]);
 }
 
 void S0ixStandby::nvmeWake()
@@ -1618,6 +1720,7 @@ void S0ixStandby::nvmeWake()
 	if (!nvN) return;
 	for (int i = (int)nvN - 1; i >= 0; i--)                   // endpoints first, then the root ports
 		if (nvChanged[i]) {
+			if (nvCtrlUp[i]) { nvmeCtrlReset(i); nvCtrlUp[i] = false; }
 			uint16_t v = nvDev[i]->configRead16(nvPm[i] + 4);
 			if (v != 0xFFFF) nvDev[i]->configWrite16(nvPm[i] + 4, (uint16_t)((v & ~3) | (nvSaved[i] & 3)));
 			IODelay(1000);
@@ -2038,6 +2141,7 @@ void S0ixStandby::battTimerFired(OSObject *owner, IOTimerEventSource *sender)
 		}
 		if (self->gpuMMIO) gDispMMIO = self->gpuMMIO;
 		self->publishTypeC();
+		if (self->nvmePs) self->nvmePrep();
 		self->publishLog();
 		sender->setTimeoutMS(60000);
 	}
