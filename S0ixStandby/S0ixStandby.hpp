@@ -276,6 +276,16 @@ private:
 	bool edWake {false};
 	IOACPIPlatformDevice *ecDev {nullptr};
 	uint8_t edQ[8] {}, edN {0}, ecStsAtHalt {0}, ecStsAtWakeP {0};
+	// -s0ixeclog (diagnostic): at the active action, if the EC GPE woke us, drain the pending EC queries (QR_EC),
+	// replay them from a thread and keep a rolling log of what each Deep Idle wake was ("EC wake log").
+	bool ecLog {false}, elPending {false};
+	uint8_t elQ[8] {}, elN {0}, elSci {0};
+	uint16_t elPm1 {0};
+	bool elEc {false};
+	thread_call_t elCall {nullptr};
+	char elLines[24][112] {};
+	uint32_t elSeq {0};
+	static void elReplay(thread_call_param_t self, thread_call_param_t);
 	bool edGpeStsAtHalt {false};
 	uint32_t sciRteLow {0}, sciRteHigh {0}, ecEnAtWake {0};
 	uint16_t pm1CntAtHalt {0}, pm1CntPort {0};

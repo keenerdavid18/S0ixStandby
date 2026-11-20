@@ -442,6 +442,7 @@ bool S0ixStandby::start(IOService *provider)
 	lwWake = bootArg("-s0ixlidwake");
 	kbWake = bootArg("-s0ixkbdwake");
 	edWake = bootArg("-s0ixecdrain");
+	ecLog = bootArg("-s0ixeclog");
 	iomNoDpof = bootArg("-s0ixnodpof");
 	tcssD3 = bootArg("-s0ixtcssd3");
 	lwPad = bootArg("-s0ixlidpad");
@@ -1275,6 +1276,20 @@ IOReturn S0ixStandby::callPlatformFunction(const OSSymbol *functionName, bool wa
 				for (uint32_t i = 0; i < gpe0Half && i < sizeof(gpe0StsAtWake); i++)
 					gpe0StsAtWake[i] = inb((uint16_t)(gpe0StsPort + i));
 				wakeInfoValid = true;
+				if (ecLog && ecGpe != 0xFFFFFFFF && lastSleepType == kSleepTypeDeepIdle) {
+					elEc = (gpe0StsAtWake[ecGpe / 8] >> (ecGpe % 8)) & 1;
+					elPm1 = pm1StsAtWake;
+					elSci = inb(0x66);
+					elN = 0;
+					for (int i = 0; i < 8 && (inb(0x66) & 0x20); i++) {     // SCI_EVT: drain the queries behind this wake
+						if (!ecWait(0x02, 0)) break;
+						outb(0x66, 0x84);                                        // QR_EC
+						if (!ecWait(0x01, 0x01)) break;
+						uint8_t q = inb(0x62);
+						if (q && elN < sizeof(elQ)) elQ[elN++] = q;
+					}
+					elPending = true;
+				}
 				if (lwArm && lwGpe != 0xFFFFFFFF && (gpe0StsAtWake[lwGpe / 8] >> (lwGpe % 8) & 1)) lwWoke = true;
 				if (lwGpioArmed) {
 					lwGpeStsAtWake = *lwGpeSts;
@@ -1389,6 +1404,7 @@ void S0ixStandby::setupWakeInfo()
 		LOG("Power button wake %s", pb);
 		if (pbWake && pbEnPort && !pbCall) pbCall = thread_call_allocate(pbUserActive, this);
 		if (edWake && !edCall) edCall = thread_call_allocate(edReplay, this);
+		if (ecLog && !elCall) elCall = thread_call_allocate(elReplay, this);
 		setProperty("EC drain", edWake ? "on (-s0ixecdrain)" : "off (boot-arg -s0ixecdrain)");
 	}
 	if (gpe && gpe + gpeLen <= 0xFFFF && gpeLen >= 2 && !(gpeLen & 1)) {
@@ -2334,6 +2350,37 @@ void S0ixStandby::onSleep()
 	    counterAtSleep, rtcBlocked ? "blocked (AC)" : "allowed");
 }
 
+void S0ixStandby::elReplay(thread_call_param_t self, thread_call_param_t)
+{
+	S0ixStandby *me = static_cast<S0ixStandby *>(self);
+	if (!me->elPending) return;
+	me->elPending = false;
+	uint8_t n = me->elN, q[8];
+	for (uint8_t i = 0; i < n; i++) q[i] = me->elQ[i];
+	for (uint8_t i = 0; i < n && me->ecDev; i++) {          // let ACPI see the events (battery, AC, lid, keys)
+		char name[8]; snprintf(name, sizeof(name), "_Q%02X", q[i]);
+		me->ecDev->evaluateObject(name);
+	}
+	clock_sec_t sec; clock_usec_t us; clock_get_calendar_microtime(&sec, &us);
+	char line[112]; int k = snprintf(line, sizeof(line), "#%u %02lu:%02lu:%02lu UTC: %s%s%s EC status 0x%02x, queries:", ++me->elSeq,
+		(unsigned long)((sec / 3600) % 24), (unsigned long)((sec / 60) % 60), (unsigned long)(sec % 60),
+		me->elEc ? "EC GPE" : "not EC", (me->elPm1 & kPm1PwrBtn) ? " +PWRBTN" : "", (me->elPm1 & (1u << 10)) ? " +RTC" : "", me->elSci);
+	for (uint8_t i = 0; i < n && k < (int)sizeof(line) - 5; i++) k += snprintf(line + k, sizeof(line) - (size_t)k, " %02X", q[i]);
+	if (!n && k < (int)sizeof(line) - 6) snprintf(line + k, sizeof(line) - (size_t)k, " none");
+	const uint32_t slot = (me->elSeq - 1) % 24;
+	snprintf(me->elLines[slot], sizeof(me->elLines[slot]), "%s", line);
+	if (OSArray *a = OSArray::withCapacity(24)) {
+		const uint32_t cnt = me->elSeq < 24 ? me->elSeq : 24;
+		for (uint32_t j = 0; j < cnt; j++) {
+			const uint32_t idx = (me->elSeq - cnt + j) % 24;
+			if (OSString *str = OSString::withCString(me->elLines[idx])) { a->setObject(str); str->release(); }
+		}
+		me->setProperty("EC wake log", a);
+		a->release();
+	}
+	LOG("EC wake: %s", line);
+}
+
 void S0ixStandby::edReplay(thread_call_param_t self, thread_call_param_t)
 {
 	// Run the EC query methods we drained at the halt, so no EC event (battery, AC, lid, keys) is lost.
@@ -2446,6 +2493,7 @@ void S0ixStandby::onWake()
 	nvmeWake();
 	nobmWake();
 	tcssWake();
+	if (elPending && elCall) { uint64_t dl; clock_interval_to_deadline(200, kMillisecondScale, &dl); thread_call_enter_delayed(elCall, dl); }
 	if (lwWake && lastSleepType == kSleepTypeDeepIdle) lidPsw(false);
 	// Before any driver wakes: Apple's accelerator restarts the engines later.
 	if (gpuMMIO) {
