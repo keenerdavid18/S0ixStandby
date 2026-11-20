@@ -306,6 +306,18 @@ private:
 	uint32_t nobmN {0}, nobmDone {0}, nobmCount {0};
 	void nobmSleep();
 	void nobmWake();
+	// NVMe drives + their CPU root ports (00:06.0/06.2): PCI PM state at the sleep action (always recorded).
+	// -s0ixnvmed0: put them back to D0 for the Deep Idle (Linux nvme.noacpi=1: NVMe D3hot pinned the package at PC3,
+	// D0 + APST/L1.2 reached PC10/S0ix 0.78 W); the wake action restores the state macOS left before drivers wake.
+	bool nvmeD0 {false};
+	static constexpr int kNvMax = 6;
+	IOPCIDevice *nvDev[kNvMax] {};
+	uint8_t nvPm[kNvMax] {};
+	uint16_t nvSaved[kNvMax] {}, nvAfter[kNvMax] {};
+	bool nvChanged[kNvMax] {};
+	uint32_t nvN {0}, nvCount {0};
+	void nvmeSleep();
+	void nvmeWake();
 	uint64_t smiLast {0}, smiTscLast {0};
 	static void iomLater(thread_call_param_t self, thread_call_param_t);
 	void setupLidWake();

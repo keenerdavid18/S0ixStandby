@@ -436,6 +436,7 @@ bool S0ixStandby::start(IOService *provider)
 	edWake = bootArg("-s0ixecdrain");
 	iomNoDpof = bootArg("-s0ixnodpof");
 	tcssD3 = bootArg("-s0ixtcssd3");
+	nvmeD0 = bootArg("-s0ixnvmed0");
 	{ uint32_t m = 0; if (PE_parse_boot_argn("s0ixnobm", &m, sizeof(m))) nobmMask = m; }
 	uint32_t fn = 0;
 	if (PE_parse_boot_argn("s0ixfn", &fn, sizeof(fn)))
@@ -1516,6 +1517,14 @@ void S0ixStandby::iomLater(thread_call_param_t self, thread_call_param_t)
 		me->setProperty("GT RC6 at last halt", g);
 		gRc6Valid = false; gRc6TscHalt = 0;
 	}
+	if (me->nvN) {
+		char t[300]; size_t n = 0;
+		n += snprintf(t + n, sizeof(t) - n, "%s, %u sleeps:", me->nvmeD0 ? "-s0ixnvmed0 on" : "observe only", me->nvCount);
+		for (uint32_t i = 0; i < me->nvN && n < sizeof(t) - 40; i++)
+			n += snprintf(t + n, sizeof(t) - n, " %02x:%02x.%x D%u%s", me->nvDev[i]->getBusNumber(), me->nvDev[i]->getDeviceNumber(),
+			              me->nvDev[i]->getFunctionNumber(), me->nvSaved[i] & 3, me->nvChanged[i] ? (me->nvAfter[i] & 3) == 0 ? "->D0" : "->D0 FAILED" : "");
+		me->setProperty("NVMe at last sleep", t);
+	}
 	if (me->nobmMask) {
 		char t[200];
 		snprintf(t, sizeof(t), "mask 0x%x: %u of %u devices had bus mastering cleared at the last sleep, %u sleeps",
@@ -1537,6 +1546,51 @@ void S0ixStandby::iomLater(thread_call_param_t self, thread_call_param_t)
 // TD3C bit when no TCSS device asks to skip D3cold, _ON (TCON) clears it and waits for TACK. macOS never does ACPI
 // runtime D3 for these devices, so TD3C stayed 0 in every Deep Idle and the package never left PC2 once the IOM was
 // told the display is off (DPOF or DC9). Only with nothing attached to USB-C (never sleep docked).
+void S0ixStandby::nvmeSleep()
+{
+	if (!nvN) {   // root ports 00:06.x first (parents), then the NVMe endpoints (class 01:08:02)
+		OSDictionary *match = serviceMatching("IOPCIDevice");
+		OSIterator *it = match ? getMatchingServices(match) : nullptr;
+		OSSafeReleaseNULL(match);
+		if (!it) return;
+		IOPCIDevice *rp[kNvMax] {}, *ep[kNvMax] {};
+		uint32_t nr = 0, ne = 0;
+		while (OSObject *o = it->getNextObject()) {
+			IOPCIDevice *d = OSDynamicCast(IOPCIDevice, o);
+			if (!d) continue;
+			if (d->getBusNumber() == 0 && d->getDeviceNumber() == 6 && nr < 2) rp[nr++] = d;
+			else if ((d->configRead32(kIOPCIConfigRevisionID) >> 8) == 0x010802 && ne < 2) ep[ne++] = d;
+		}
+		it->release();
+		for (uint32_t i = 0; i < nr; i++) { rp[i]->retain(); nvDev[nvN++] = rp[i]; }
+		for (uint32_t i = 0; i < ne; i++) { ep[i]->retain(); nvDev[nvN++] = ep[i]; }
+		for (uint32_t i = 0; i < nvN; i++) { uint8_t pm = 0; nvDev[i]->findPCICapability(kIOPCIPowerManagementCapability, &pm); nvPm[i] = pm; }
+	}
+	for (uint32_t i = 0; i < nvN; i++) {
+		nvChanged[i] = false;
+		nvSaved[i] = nvPm[i] ? nvDev[i]->configRead16(nvPm[i] + 4) : 0;
+		nvAfter[i] = nvSaved[i];
+		if (nvmeD0 && nvPm[i] && (nvSaved[i] & 3) && nvSaved[i] != 0xFFFF) {
+			nvDev[i]->configWrite16(nvPm[i] + 4, (uint16_t)(nvSaved[i] & ~3));
+			IODelay(10000);                                   // D3hot -> D0: 10 ms
+			nvAfter[i] = nvDev[i]->configRead16(nvPm[i] + 4);
+			nvChanged[i] = true;
+		}
+	}
+}
+
+void S0ixStandby::nvmeWake()
+{
+	if (!nvN) return;
+	for (int i = (int)nvN - 1; i >= 0; i--)                   // endpoints first, then the root ports
+		if (nvChanged[i]) {
+			uint16_t v = nvDev[i]->configRead16(nvPm[i] + 4);
+			if (v != 0xFFFF) nvDev[i]->configWrite16(nvPm[i] + 4, (uint16_t)((v & ~3) | (nvSaved[i] & 3)));
+			IODelay(1000);
+		}
+	nvCount++;
+}
+
 void S0ixStandby::nobmSleep()
 {
 	static const struct { uint32_t bit; uint8_t dev, fn; } kList[] = {
@@ -1982,6 +2036,7 @@ void S0ixStandby::onSleep()
 	if (lwWake && lastSleepType == kSleepTypeDeepIdle) lidPsw(true);   // while the EC still answers normally
 	if (tcssD3 && lastSleepType == kSleepTypeDeepIdle) tcssSleep();   // before the LPS0 entry _DSM, like Linux
 	if (nobmMask && lastSleepType == kSleepTypeDeepIdle) nobmSleep();
+	if (lastSleepType == kSleepTypeDeepIdle) nvmeSleep();
 	entered = false;
 	if (dsmEnabled && lastSleepType == kSleepTypeDeepIdle &&
 	    (dsmMask[kIntel] || dsmMask[kMicrosoft] || dsmMask[kAMD])) {
@@ -2132,6 +2187,7 @@ void S0ixStandby::onWake()
 		}
 		entered = false;
 	}
+	nvmeWake();
 	nobmWake();
 	tcssWake();
 	if (lwWake && lastSleepType == kSleepTypeDeepIdle) lidPsw(false);
