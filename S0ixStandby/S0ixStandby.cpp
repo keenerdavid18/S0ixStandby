@@ -1593,7 +1593,7 @@ void S0ixStandby::nvmePrep()
 		if ((nvDev[i]->configRead32(kIOPCIConfigRevisionID) >> 8) != 0x010802) continue;
 		if (!nvBuf[i]) {
 			nvBuf[i] = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
-			                                                           3 * 4096, 0x00000000FFFFF000ULL);
+			                                                           5 * 4096, 0x00000000FFFFF000ULL);
 			if (nvBuf[i] && nvBuf[i]->prepare() != kIOReturnSuccess) OSSafeReleaseNULL(nvBuf[i]);
 		}
 		if (!nvBar[i] && nvDev[i]->configRead16(nvPm[i] + 4) != 0xFFFF && !(nvDev[i]->configRead16(nvPm[i] + 4) & 3))
@@ -1664,9 +1664,9 @@ bool S0ixStandby::nvmeCtrlPs(uint32_t i)
 	w32(0x14, r32(0x14) & ~1u);
 	if (!waitRdy(0)) { info("reset timeout"); return false; }
 	uint8_t *mem = reinterpret_cast<uint8_t *>(nvBuf[i]->getBytesNoCopy());
-	bzero(mem, 3 * 4096);
+	bzero(mem, 5 * 4096);
 	const uint64_t pa = nvBuf[i]->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
-	w32(0x24, (3u << 16) | 3u);                               // 4-entry admin SQ / CQ
+	w32(0x24, (7u << 16) | 7u);                               // 8-entry admin SQ / CQ (no wrap: 5 commands)
 	w64(0x28, pa); w64(0x30, pa + 4096);
 	w32(0x14, (4u << 20) | (6u << 16) | 1u);                  // IOCQES 16 B, IOSQES 64 B, MPS 4 KB, NVM, EN
 	if (!waitRdy(1)) { info("enable timeout"); w32(0x14, 0); waitRdy(0); return false; }
@@ -1678,7 +1678,7 @@ bool S0ixStandby::nvmeCtrlPs(uint32_t i)
 		sq[6] = (uint32_t)prp1; sq[7] = (uint32_t)(prp1 >> 32);
 		sq[10] = c10; sq[11] = c11;
 		const uint32_t slot = tail;
-		tail = (tail + 1) & 3;
+		tail = (tail + 1) & 7;
 		OSSynchronizeIO();
 		w32(0x1000, tail);
 		volatile uint32_t *cq = reinterpret_cast<volatile uint32_t *>(mem + 4096 + slot * 16);
@@ -1697,10 +1697,19 @@ bool S0ixStandby::nvmeCtrlPs(uint32_t i)
 	int ps = -1;
 	for (int k = (int)npss; k >= 0; k--) if (id[2048 + 32 * k + 3] & 2) { ps = k; break; }   // deepest non-operational
 	if (ps < 0) ps = (int)npss;
+	// like a normally initialised (Linux) controller: one I/O queue pair (Number of Queues, Create I/O CQ, Create I/O SQ)
+	bool ioq = admin(0x09, 3, 0, 0x07, 0, st) && !st;                                     // Set Features: 1 SQ + 1 CQ
+	const uint32_t stNq = st;
+	if (ioq) ioq = admin(0x05, 4, pa + 4 * 4096, (3u << 16) | 1u, 1u, st) && !st;        // Create I/O CQ 1, 4 entries, PC, no IRQ
+	const uint32_t stCq = st;
+	if (ioq) ioq = admin(0x01, 5, pa + 3 * 4096, (3u << 16) | 1u, (1u << 16) | 1u, st) && !st;   // Create I/O SQ 1 -> CQ 1, PC
+	uint8_t msix = 0; d->findPCICapability(kIOPCIMSIXCapability, &msix);
+	const bool msixOn = msix && (d->configRead16(msix + 2) & 0x8000);
 	if (!admin(0x09, 2, 0, 0x02, (uint32_t)ps, st) || st) {    // Set Features: Power Management
 		snprintf(nvPsInfo[i], sizeof(nvPsInfo[i]), "set PS%d failed (status 0x%x, npss %u)", ps, st, npss); w32(0x14, 0); waitRdy(0); return false;
 	}
-	snprintf(nvPsInfo[i], sizeof(nvPsInfo[i]), "PS%d of 0-%u (CAP.TO %u ms)", ps, npss, toMs);
+	snprintf(nvPsInfo[i], sizeof(nvPsInfo[i]), "PS%d of 0-%u, I/O queues %s (nq %x cq %x sq %x), MSI-X %s", ps, npss,
+	         ioq ? "ok" : "FAILED", stNq, stCq, st, msix ? (msixOn ? "on" : "off") : "none");
 	return true;
 }
 

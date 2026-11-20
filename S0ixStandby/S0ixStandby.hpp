@@ -328,10 +328,10 @@ private:
 	// power state; at wake reset the controller (CC.EN=0) before macOS's NVMe driver re-initialises it.
 	bool nvmePs {false};
 	IOMemoryMap *nvBar[kNvMax] {};
-	IOBufferMemoryDescriptor *nvBuf[kNvMax] {};          // 3 pages: SQ, CQ, identify data
+	IOBufferMemoryDescriptor *nvBuf[kNvMax] {};          // 5 pages: admin SQ, admin CQ, identify, I/O SQ, I/O CQ
 	uint16_t nvCmdSaved[kNvMax] {};
 	bool nvCtrlUp[kNvMax] {};
-	char nvPsInfo[kNvMax][96] {};
+	char nvPsInfo[kNvMax][140] {};
 	bool nvmeCtrlPs(uint32_t i);
 	void nvmePrep();
 	void nvmeCtrlReset(uint32_t i);
