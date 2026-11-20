@@ -275,12 +275,50 @@ static int pmcPageHandler(struct sysctl_oid *, void *, int, struct sysctl_req *r
 	IOLockUnlock(gCoreSnapLock);
 	return err;
 }
+// Display engine registers (same ranges as macos/pmcdump PMCDump.cpp / gpu-wm.py: DBUF, WM_LINETIME, DC_STATE,
+// transcoder A/B timings, pipes A-D cursor/planes/watermarks/DDB, DMC DC5/DC6 counts). debug.s0ix.disp = live,
+// debug.s0ix.disphalt = read at the last Deep Idle quiesce action (just before the halt), as u32 values in range order.
+struct DispRange { uint32_t from, to; };
+static constexpr DispRange kDispRanges[] = {
+	{0x44FE0, 0x45040}, {0x45270, 0x45280}, {0x45500, 0x45530}, {0x60000, 0x60080}, {0x61000, 0x61080},
+	{0x70000, 0x70600}, {0x71000, 0x71600}, {0x72000, 0x72600}, {0x73000, 0x73600}, {0x101080, 0x101090},
+};
+static constexpr uint32_t dispRegCount() { uint32_t n = 0; for (auto &r : kDispRanges) n += (r.to - r.from) / 4; return n; }
+static volatile uint8_t *gDispMMIO;      // set while the GPU BAR is mapped and in D0 with memory decode (checked at sleep)
+static bool gDispOk;                     // onSleep: GPU in D0 with memory decode -> the quiesce read is safe
+static uint32_t gDispHalt[dispRegCount()], gDispLive[dispRegCount()];
+static bool gDispHaltValid;
+static void dispRead(uint32_t *out)
+{
+	uint32_t n = 0;
+	for (auto &r : kDispRanges)
+		for (uint32_t o = r.from; o < r.to; o += 4) out[n++] = *reinterpret_cast<volatile uint32_t *>(gDispMMIO + o);
+}
+static int dispHandler(struct sysctl_oid *, void *arg1, int, struct sysctl_req *req)
+{
+	if (req->newptr) return EPERM;
+	if (!gCoreSnapLock) return ENOENT;
+	if (arg1) {   // halt copy
+		if (!gDispHaltValid) return ENOENT;
+		return SYSCTL_OUT(req, gDispHalt, sizeof(gDispHalt));
+	}
+	if (!gDispMMIO) return ENOENT;
+	IOLockLock(gCoreSnapLock);
+	dispRead(gDispLive);
+	int err = SYSCTL_OUT(req, gDispLive, sizeof(gDispLive));
+	IOLockUnlock(gCoreSnapLock);
+	return err;
+}
 SYSCTL_DECL(_debug);
 SYSCTL_NODE(_debug, OID_AUTO, s0ix, CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, "S0ixStandby");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, cores, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
             coreSnapHandler, "S", "per-CPU TSC + core C3/C6/C7 + Atom module C6 residency");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, pmc, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
             pmcPageHandler, "S", "live PMC page (the LPIT counter's 4 KB MMIO page)");
+SYSCTL_PROC(_debug_s0ix, OID_AUTO, disp, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
+            dispHandler, "S", "live display registers");
+SYSCTL_PROC(_debug_s0ix, OID_AUTO, disphalt, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, (void *)1, 0,
+            dispHandler, "S", "display registers at the last Deep Idle quiesce");
 
 // C-state residency MSRs (Intel SDM vol. 4). All count at TSC rate.
 struct CState { const char *name; uint32_t msr; };
@@ -545,6 +583,8 @@ bool S0ixStandby::start(IOService *provider)
 		sysctl_register_oid(&sysctl__debug_s0ix);
 		sysctl_register_oid(&sysctl__debug_s0ix_cores);
 		sysctl_register_oid(&sysctl__debug_s0ix_pmc);
+		sysctl_register_oid(&sysctl__debug_s0ix_disp);
+		sysctl_register_oid(&sysctl__debug_s0ix_disphalt);
 		gPmcPage = counterPage;
 	}
 	publishLog();
@@ -555,6 +595,9 @@ void S0ixStandby::stop(IOService *provider)
 {
 	if (gCoreSnapLock) {
 		gPmcPage = nullptr;
+		gDispMMIO = nullptr;
+		sysctl_unregister_oid(&sysctl__debug_s0ix_disphalt);
+		sysctl_unregister_oid(&sysctl__debug_s0ix_disp);
 		sysctl_unregister_oid(&sysctl__debug_s0ix_pmc);
 		sysctl_unregister_oid(&sysctl__debug_s0ix_cores);
 		sysctl_unregister_oid(&sysctl__debug_s0ix);
@@ -1170,6 +1213,7 @@ IOReturn S0ixStandby::callPlatformFunction(const OSSymbol *functionName, bool wa
 					uint32_t d = inl((uint16_t)(gpe0EnPort + i));
 					for (uint32_t b = 0; b < 4; b++) gpe0EnAtHalt[i + b] = (uint8_t)(d >> (8 * b));
 				}
+			if (gDispOk && gDispMMIO) { dispRead(gDispHalt); gDispHaltValid = true; }
 			if (cstateMask) { readHalt(haltAtQuiesce); tscAtQuiesce = rdtsc(); haltValid = false; }
 			if (pmcDump && counterPage) {
 				for (uint32_t i = 0; i < 1024; i++) pmcAtHalt[i] = counterPage[i];
@@ -1776,6 +1820,7 @@ void S0ixStandby::battTimerFired(OSObject *owner, IOTimerEventSource *sender)
 			self->findEcGpe();
 			if (self->ecGpe != 0xFFFFFFFF) self->publishEcWake();
 		}
+		if (self->gpuMMIO) gDispMMIO = self->gpuMMIO;
 		self->publishTypeC();
 		self->publishLog();
 		sender->setTimeoutMS(60000);
@@ -1799,6 +1844,8 @@ void S0ixStandby::onSleep()
 	if (gpuMMIO) {
 		gpuSleep();
 		dispCapture(dispAtSleep, nullptr);
+		gDispMMIO = gpuMMIO;
+		gDispOk = dispAtSleep.valid;
 		if (refclkWA) refclkSleep();
 	}
 	// Drivers (and IOPCIFamily's D3 transition) are done by now.
