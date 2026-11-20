@@ -288,6 +288,11 @@ static volatile uint8_t *gDispMMIO;      // set while the GPU BAR is mapped and 
 static bool gDispOk;                     // onSleep: GPU in D0 with memory decode -> the quiesce read is safe
 static uint32_t gDispHalt[dispRegCount()], gDispLive[dispRegCount()];
 static bool gDispHaltValid;
+// GT RC6 around the halt (Dell G15 / WhateverXe #80: package stuck shallow while the GT was kept out of RC6):
+// GEN6_GT_GFX_RC6 0x138108 (residency, 1.28 us units, no forcewake needed), GEN6_RC_STATE 0x138104.
+static uint32_t gRc6Halt, gRc6Active, gRcStateHalt, gRcStateActive;
+static uint64_t gRc6TscHalt, gRc6TscActive;
+static bool gRc6Valid;
 static void dispRead(uint32_t *out)
 {
 	uint32_t n = 0;
@@ -1215,6 +1220,7 @@ IOReturn S0ixStandby::callPlatformFunction(const OSSymbol *functionName, bool wa
 					for (uint32_t b = 0; b < 4; b++) gpe0EnAtHalt[i + b] = (uint8_t)(d >> (8 * b));
 				}
 			if (gDispOk && gDispMMIO) { dispRead(gDispHalt); gDispHaltValid = true; }
+			if (gDispOk && gDispMMIO) { gRc6Halt = *reinterpret_cast<volatile uint32_t *>(gDispMMIO + 0x138108); gRcStateHalt = *reinterpret_cast<volatile uint32_t *>(gDispMMIO + 0x138104); gRc6TscHalt = rdtsc(); gRc6Valid = false; }
 			if (cstateMask) { readHalt(haltAtQuiesce); tscAtQuiesce = rdtsc(); haltValid = false; }
 			if (pmcDump && counterPage) {
 				for (uint32_t i = 0; i < 1024; i++) pmcAtHalt[i] = counterPage[i];
@@ -1262,6 +1268,12 @@ IOReturn S0ixStandby::callPlatformFunction(const OSSymbol *functionName, bool wa
 			if (pmcDump && counterPage && pmcHaltValid) {
 				for (uint32_t i = 0; i < 1024; i++) pmcAtActive[i] = counterPage[i];
 				pmcActiveValid = true;
+			}
+			if (gDispMMIO && gRc6TscHalt) {
+				gRc6Active = *reinterpret_cast<volatile uint32_t *>(gDispMMIO + 0x138108);
+				gRcStateActive = *reinterpret_cast<volatile uint32_t *>(gDispMMIO + 0x138104);
+				gRc6TscActive = rdtsc();
+				gRc6Valid = true;
 			}
 			return kIOReturnSuccess;
 		}
@@ -1495,6 +1507,14 @@ void S0ixStandby::iomLater(thread_call_param_t self, thread_call_param_t)
 	snprintf(b, sizeof(b), "before entry 0x%08x, after entry 0x%08x, wake before exit 0x%08x, after exit 0x%08x, +2 s 0x%08x",
 	         me->iomV[0], me->iomV[1], me->iomV[2], me->iomV[3], me->iomV[4]);
 	me->setProperty("Type-C IOM at last sleep", b);
+	if (gRc6Valid) {
+		char g[200];
+		snprintf(g, sizeof(g), "RC6 counter %u -> %u (+%u x 1.28 us), TSC +%llu, RC_STATE 0x%08x -> 0x%08x",
+		         gRc6Halt, gRc6Active, gRc6Active - gRc6Halt, (unsigned long long)(gRc6TscActive - gRc6TscHalt),
+		         gRcStateHalt, gRcStateActive);
+		me->setProperty("GT RC6 at last halt", g);
+		gRc6Valid = false; gRc6TscHalt = 0;
+	}
 	if (me->tcssD3) {
 		char t[260];
 		snprintf(t, sizeof(t), "%u sleeps; xHCI 0d.0 PMCSR at sleep 0x%04x (restored to 0x%04x); TCOF 0x%x%s: IOM 0x%08x -> 0x%08x "
