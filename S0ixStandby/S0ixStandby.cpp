@@ -1284,17 +1284,32 @@ void S0ixStandby::setupLidWake()
 	// GPIO-routed GPE (DW0..DW2 = GPEs 0x00-0x5F): find its group/pad from the BIOS GNVS (GEI0-2 group, GED0-2 dword)
 	// and the GPIO community's GPI_GPE_STS / GPI_GPE_EN through the DSDT's own helper \_SB.GADR(group, 5).
 	if (lwGpe != 0xFFFFFFFF && lwGpe < 0x60 && lwDev[0]) {
-		static const char *gei[3] = { "\\GEI0", "\\GEI1", "\\GEI2" };
-		static const char *ged[3] = { "\\GED0", "\\GED1", "\\GED2" };
+		// Apple's evaluateObject resolves names relative to the device: use \_SB (LID's parent in the ACPI plane)
+		// and ACPI's parent prefix for the root-level GNVS fields.
+		static const char *gei[3] = { "^GEI0", "^GEI1", "^GEI2" };
+		static const char *ged[3] = { "^GED0", "^GED1", "^GED2" };
 		UInt32 grp = 0, dw = 0;
 		uint32_t blk = lwGpe / 32;
 		char gb[160] = "";
-		if (lwDev[0]->evaluateInteger(gei[blk], &grp) == kIOReturnSuccess &&
-		    lwDev[0]->evaluateInteger(ged[blk], &dw) == kIOReturnSuccess) {
+		IOACPIPlatformDevice *sb = nullptr;
+		if (const IORegistryPlane *ap = IORegistryEntry::getPlane("IOACPIPlane"))
+			sb = OSDynamicCast(IOACPIPlatformDevice, lwDev[0]->getParentEntry(ap));
+		const char *form = nullptr;
+		if (sb) {
+			char n1[8], n2[8];
+			static const char *pre[3] = { "^", "\\", "" };
+			for (int k = 0; k < 3 && !form; k++) {
+				snprintf(n1, sizeof(n1), "%s%s", pre[k], gei[blk] + 1);
+				snprintf(n2, sizeof(n2), "%s%s", pre[k], ged[blk] + 1);
+				if (sb->evaluateInteger(n1, &grp) == kIOReturnSuccess && sb->evaluateInteger(n2, &dw) == kIOReturnSuccess)
+					form = k == 0 ? "^name" : k == 1 ? "\\name" : "name";
+			}
+		}
+		if (form) {
 			OSObject *args[2] = { OSNumber::withNumber(grp, 32), OSNumber::withNumber(5, 32) };
 			OSObject *res = nullptr;
 			uint64_t sts = 0;
-			if (args[0] && args[1] && lwDev[0]->evaluateObject("\\_SB.GADR", &res, args, 2) == kIOReturnSuccess && res)
+			if (args[0] && args[1] && sb->evaluateObject("GADR", &res, args, 2) == kIOReturnSuccess && res)
 				if (OSNumber *n = OSDynamicCast(OSNumber, res)) sts = n->unsigned64BitValue() + (uint64_t)dw * 4;
 			OSSafeReleaseNULL(res);
 			OSSafeReleaseNULL(args[0]); OSSafeReleaseNULL(args[1]);
@@ -1303,10 +1318,10 @@ void S0ixStandby::setupLidWake()
 			OSObject *pa = OSNumber::withNumber(((uint64_t)grp << 16) | pad, 32);
 			if (pa) {
 				OSObject *r2 = nullptr;
-				if (lwDev[0]->evaluateObject("\\_SB.GPC0", &r2, &pa, 1) == kIOReturnSuccess && r2)
+				if (sb->evaluateObject("GPC0", &r2, &pa, 1) == kIOReturnSuccess && r2)
 					if (OSNumber *n = OSDynamicCast(OSNumber, r2)) padcfg = n->unsigned32BitValue();
 				OSSafeReleaseNULL(r2);
-				if (lwDev[0]->evaluateObject("\\_SB.GHPO", &r2, &pa, 1) == kIOReturnSuccess && r2)
+				if (sb->evaluateObject("GHPO", &r2, &pa, 1) == kIOReturnSuccess && r2)
 					if (OSNumber *n = OSDynamicCast(OSNumber, r2)) own = n->unsigned32BitValue();
 				OSSafeReleaseNULL(r2);
 				pa->release();
@@ -1323,10 +1338,10 @@ void S0ixStandby::setupLidWake()
 					}
 				}
 			}
-			snprintf(gb, sizeof(gb), "GPE 0x%x = GPIO group %u pad %u, GPI_GPE_STS 0x%llx (EN +0x20)%s, PADCFG0 0x%08x, HOSTSW_OWN %u",
-			         lwGpe, (unsigned)grp, pad, (unsigned long long)sts, lwGpeEn ? "" : " NOT MAPPED", padcfg, own);
+			snprintf(gb, sizeof(gb), "GPE 0x%x = GPIO group %u pad %u, GPI_GPE_STS 0x%llx (EN +0x20)%s, PADCFG0 0x%08x, HOSTSW_OWN %u [%s]",
+			         lwGpe, (unsigned)grp, pad, (unsigned long long)sts, lwGpeEn ? "" : " NOT MAPPED", padcfg, own, form);
 		} else {
-			snprintf(gb, sizeof(gb), "GPE 0x%x: GEI/GED not readable", lwGpe);
+			snprintf(gb, sizeof(gb), "GPE 0x%x: GEI/GED not readable (\\_SB %s)", lwGpe, sb ? sb->getName() : "not found");
 		}
 		setProperty("Lid wake GPIO", gb);
 		LOG("Lid wake GPIO %s", gb);
