@@ -539,8 +539,10 @@ bool S0ixStandby::start(IOService *provider)
 		setProperty("Wi-Fi PCI PM", "pending (set up 30 s after boot)");
 	}
 
-	if (acNoRtc) {
-		if (setupRtcBlock() && workLoop) {
+	if (acNoRtc || acNoEc) {
+		// the AC timer also drives -s0ixacnoec (it was only created for -s0ixacnortc: acnoec never ran)
+		if ((acNoEc || setupRtcBlock()) && workLoop) {
+			if (acNoRtc && acNoEc) setupRtcBlock();
 			acTimer = IOTimerEventSource::timerEventSource(this, &S0ixStandby::acTimerFired);
 			if (acTimer && workLoop->addEventSource(acTimer) != kIOReturnSuccess)
 				OSSafeReleaseNULL(acTimer);
