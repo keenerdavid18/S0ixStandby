@@ -159,6 +159,14 @@ static const uint32_t kSleepTypeDeepIdle = 7;   // kIOPMSleepTypeDeepIdle
 static const uint16_t kPm1RtcEn = 1u << 10;      // PM1_EN.RTC_EN (ACPI fixed event)
 static const uint16_t kPm1PwrBtn = 1u << 8;       // PM1_STS.PWRBTN_STS / PM1_EN.PWRBTN_EN
 static uint8_t kbcArm(uint8_t &before, uint8_t &after);
+// PCH GPE0 registers: use aligned 32-bit I/O (byte writes to GPE0_EN did not stick on Alder/Raptor Lake PCH).
+static uint32_t gpeEnSet(uint16_t enBase, uint32_t gpe)
+{
+	uint16_t p = (uint16_t)(enBase + (gpe / 32) * 4);
+	uint32_t m = 1u << (gpe % 32), v = inl(p);
+	if (!(v & m)) outl(p, v | m);
+	return inl(p);
+}
 static const uint8_t  kCmosAie  = 1u << 5;       // RTC register B: alarm interrupt enable
 static inline uint8_t cmosRead(uint8_t reg) { outb(0x70, reg); return inb(0x71); }
 static inline void cmosWrite(uint8_t reg, uint8_t v) { outb(0x70, reg); outb(0x71, v); }
@@ -1015,14 +1023,7 @@ IOReturn S0ixStandby::callPlatformFunction(const OSSymbol *functionName, bool wa
 		if (functionName->isEqualTo("IOPlatformQuiesceAction")) {
 			if (rtcBlocked) outw(pm1EnPort, (uint16_t)(inw(pm1EnPort) & ~kPm1RtcEn));
 			if (kbArm) kbArmResult = kbcArm(kbCfgBefore, kbCfgSet);
-			if (lwArm && lwGpe != 0xFFFFFFFF) {
-				uint16_t p = (uint16_t)(gpe0EnPort + lwGpe / 8);
-				uint8_t m = (uint8_t)(1u << (lwGpe % 8)), v = inb(p);
-				if (!(v & m)) outb(p, (uint8_t)(v | m));
-			}
-			if (gpe0EnPort)
-				for (uint32_t i = 0; i < gpe0Half && i < sizeof(gpe0EnAtHalt); i++)
-					gpe0EnAtHalt[i] = inb((uint16_t)(gpe0EnPort + i));
+			if (lwArm && lwGpe != 0xFFFFFFFF) lwEnReadback = gpeEnSet(gpe0EnPort, lwGpe);
 			if (pbArm) {
 				// The laptop reports its power button through the EC (FADT control-method button), so the OS
 				// never enables the PCH's fixed PWRBTN event; the EC is in standby and does not deliver the
@@ -1033,13 +1034,19 @@ IOReturn S0ixStandby::callPlatformFunction(const OSSymbol *functionName, bool wa
 			}
 			if (ecArm) {
 				// Last thing before the halt: macOS has set up its wake GPEs.
-				uint16_t p = (uint16_t)(gpe0EnPort + ecGpe / 8);
-				uint8_t m = (uint8_t)(1u << (ecGpe % 8)), v = inb(p);
-				ecEnAtHalt = (v & m) ? 1 : 0;
-				if (!(v & m)) { outb(p, (uint8_t)(v | m)); ecArmed = true; }
+				uint16_t p = (uint16_t)(gpe0EnPort + (ecGpe / 32) * 4);
+				uint32_t v = inl(p);
+				ecEnAtHalt = (v >> (ecGpe % 32)) & 1;
+				ecEnReadback = gpeEnSet(gpe0EnPort, ecGpe);
+				if (!ecEnAtHalt) ecArmed = true;
 			} else if (gpe0EnPort && ecGpe != 0xFFFFFFFF) {
 				ecEnAtHalt = (inb((uint16_t)(gpe0EnPort + ecGpe / 8)) >> (ecGpe % 8)) & 1;
 			}
+			if (gpe0EnPort)
+				for (uint32_t i = 0; i + 4 <= gpe0Half && i + 4 <= sizeof(gpe0EnAtHalt); i += 4) {
+					uint32_t d = inl((uint16_t)(gpe0EnPort + i));
+					for (uint32_t b = 0; b < 4; b++) gpe0EnAtHalt[i + b] = (uint8_t)(d >> (8 * b));
+				}
 			if (cstateMask) { readHalt(haltAtQuiesce); tscAtQuiesce = rdtsc(); haltValid = false; }
 			if (pmcDump && counterPage) {
 				for (uint32_t i = 0; i < 1024; i++) pmcAtHalt[i] = counterPage[i];
@@ -1328,6 +1335,9 @@ void S0ixStandby::publishWakeInfo()
 		for (uint32_t i = 0; i < gpe0Half && i < sizeof(gpe0EnAtHalt); i++)
 			k += snprintf(en + k, sizeof(en) - k, "%02x", gpe0EnAtHalt[i]);
 		setProperty("GPE0_EN at last halt (byte 0 first)", en);
+		char rb[96];
+		snprintf(rb, sizeof(rb), "lid GPE dword 0x%08x, EC GPE dword 0x%08x (after arming, 32-bit I/O)", lwEnReadback, ecEnReadback);
+		setProperty("GPE0_EN readback at last halt", rb);
 	}
 	if (ecGpe != 0xFFFFFFFF) {
 		snprintf(buf, sizeof(buf), "%s by macOS%s", ecEnAtHalt ? "enabled" : "disabled",

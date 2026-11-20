@@ -250,6 +250,7 @@ private:
 	IOACPIPlatformDevice *lwDev[2] {nullptr, nullptr};
 	uint32_t lwGpe {0xFFFFFFFF}, lwWakeCount {0};
 	uint8_t gpe0EnAtHalt[16] {};
+	uint32_t lwEnReadback {0}, ecEnReadback {0};   // 32-bit GPE0_EN dword after arming
 	// -s0ixkbdwake: PS/2 keyboard (i8042) as a Deep Idle wake source, armed only when the lid is open.
 	bool kbWake {false}, kbArm {false};
 	volatile bool kbWoke {false};
