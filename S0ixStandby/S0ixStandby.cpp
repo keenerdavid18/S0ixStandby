@@ -260,10 +260,27 @@ static int coreSnapHandler(struct sysctl_oid *, void *, int, struct sysctl_req *
 	IOLockUnlock(gCoreSnapLock);
 	return err;
 }
+// Live copy of the PMC MMIO page that holds the LPIT residency counter (0xFE001000 here = PMC offsets 0x1000-0x1FFF:
+// LTR_IGNORE 0x1B0C, LTR 0x1B50-0x1C0C, LPM status 0x1C34+, PPFEAR 0x1D90) - sysctl debug.s0ix.pmc, read-only.
+// Same layout as the "PMC page at halt" / "after halt" properties of -s0ixpmcdump, so awake vs halt compare 1:1.
+static volatile uint32_t *gPmcPage;
+static uint32_t gPmcCopy[1024];
+static int pmcPageHandler(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+	if (req->newptr) return EPERM;
+	if (!gCoreSnapLock || !gPmcPage) return ENOENT;
+	IOLockLock(gCoreSnapLock);
+	for (uint32_t i = 0; i < 1024; i++) gPmcCopy[i] = gPmcPage[i];
+	int err = SYSCTL_OUT(req, gPmcCopy, sizeof(gPmcCopy));
+	IOLockUnlock(gCoreSnapLock);
+	return err;
+}
 SYSCTL_DECL(_debug);
 SYSCTL_NODE(_debug, OID_AUTO, s0ix, CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, "S0ixStandby");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, cores, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
             coreSnapHandler, "S", "per-CPU TSC + core C3/C6/C7 + Atom module C6 residency");
+SYSCTL_PROC(_debug_s0ix, OID_AUTO, pmc, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
+            pmcPageHandler, "S", "live PMC page (the LPIT counter's 4 KB MMIO page)");
 
 // C-state residency MSRs (Intel SDM vol. 4). All count at TSC rate.
 struct CState { const char *name; uint32_t msr; };
@@ -527,6 +544,8 @@ bool S0ixStandby::start(IOService *provider)
 	if (gCoreSnapLock) {
 		sysctl_register_oid(&sysctl__debug_s0ix);
 		sysctl_register_oid(&sysctl__debug_s0ix_cores);
+		sysctl_register_oid(&sysctl__debug_s0ix_pmc);
+		gPmcPage = counterPage;
 	}
 	publishLog();
 	return true;
@@ -535,6 +554,8 @@ bool S0ixStandby::start(IOService *provider)
 void S0ixStandby::stop(IOService *provider)
 {
 	if (gCoreSnapLock) {
+		gPmcPage = nullptr;
+		sysctl_unregister_oid(&sysctl__debug_s0ix_pmc);
 		sysctl_unregister_oid(&sysctl__debug_s0ix_cores);
 		sysctl_unregister_oid(&sysctl__debug_s0ix);
 	}
