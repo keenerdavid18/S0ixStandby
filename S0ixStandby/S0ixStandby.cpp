@@ -314,6 +314,31 @@ static int dispHandler(struct sysctl_oid *, void *arg1, int, struct sysctl_req *
 	IOLockUnlock(gCoreSnapLock);
 	return err;
 }
+// NVMe root ports + drives, full config space via ECAM: debug.s0ix.nvcfg = header (16 u32: slot count, halt valid,
+// active valid, sleep count, then the bus<<8|dev<<3|fn of each slot or 0xFFFFFFFF) + live + at the last quiesce
+// (root ports only: a config read to a drive would pull its link out of L1.2) + at the following active action,
+// each kNvCfgSlots x 1024 u32.
+static constexpr uint32_t kNvCfgSlots = 6;
+static volatile uint32_t *gNvCfg[kNvCfgSlots];
+static uint32_t gNvCfgBdf[kNvCfgSlots] = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
+static uint32_t gNvCfgSnap[3][kNvCfgSlots][1024];   // [0] live (sysctl), [1] quiesce, [2] active
+static bool gNvCfgHaltValid, gNvCfgActiveValid;
+static uint32_t gNvCfgSleeps;
+static int nvCfgHandler(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+	if (req->newptr) return EPERM;
+	if (!gCoreSnapLock) return ENOENT;
+	IOLockLock(gCoreSnapLock);
+	uint32_t hdr[16] = {kNvCfgSlots, gNvCfgHaltValid, gNvCfgActiveValid, gNvCfgSleeps};
+	for (uint32_t s = 0; s < kNvCfgSlots; s++) {
+		hdr[4 + s] = gNvCfgBdf[s];
+		for (uint32_t i = 0; i < 1024; i++) gNvCfgSnap[0][s][i] = gNvCfg[s] ? gNvCfg[s][i] : 0xFFFFFFFF;
+	}
+	int err = SYSCTL_OUT(req, hdr, sizeof(hdr));
+	if (!err) err = SYSCTL_OUT(req, gNvCfgSnap, sizeof(gNvCfgSnap));
+	IOLockUnlock(gCoreSnapLock);
+	return err;
+}
 // NVMe handling for the next Deep Idle, switchable at runtime: sudo sysctl debug.s0ix.nvme=<v>
 //   v & 0xF: 0 = macOS default (drives in D3), 1 = D0 with the controller left shut down, 2 = D0 + live controller in
 //   its deepest PS (I/O queue pair); 0x10 = mask MSI-X (function mask) during the halt (mode 2);
@@ -332,6 +357,8 @@ SYSCTL_PROC(_debug_s0ix, OID_AUTO, disp, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_L
             dispHandler, "S", "live display registers");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, disphalt, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, (void *)1, 0,
             dispHandler, "S", "display registers at the last Deep Idle quiesce");
+SYSCTL_PROC(_debug_s0ix, OID_AUTO, nvcfg, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
+            nvCfgHandler, "S", "NVMe root port + drive config space: live, at the last quiesce, after it");
 
 // C-state residency MSRs (Intel SDM vol. 4). All count at TSC rate.
 struct CState { const char *name; uint32_t msr; };
@@ -609,6 +636,7 @@ bool S0ixStandby::start(IOService *provider)
 		sysctl_register_oid(&sysctl__debug_s0ix_nvme);
 		sysctl_register_oid(&sysctl__debug_s0ix_disp);
 		sysctl_register_oid(&sysctl__debug_s0ix_disphalt);
+		sysctl_register_oid(&sysctl__debug_s0ix_nvcfg);
 		gPmcPage = counterPage;
 	}
 	publishLog();
@@ -620,6 +648,10 @@ void S0ixStandby::stop(IOService *provider)
 	if (gCoreSnapLock) {
 		gPmcPage = nullptr;
 		gDispMMIO = nullptr;
+		IOLockLock(gCoreSnapLock);
+		for (uint32_t s = 0; s < kNvCfgSlots; s++) gNvCfg[s] = nullptr;
+		IOLockUnlock(gCoreSnapLock);
+		sysctl_unregister_oid(&sysctl__debug_s0ix_nvcfg);
 		sysctl_unregister_oid(&sysctl__debug_s0ix_disphalt);
 		sysctl_unregister_oid(&sysctl__debug_s0ix_disp);
 		sysctl_unregister_oid(&sysctl__debug_s0ix_nvme);
@@ -682,6 +714,7 @@ void S0ixStandby::free()
 	counter = nullptr;
 	counterPage = nullptr;
 	OSSafeReleaseNULL(counterMap);
+	for (uint32_t i = 0; i < kNvMax; i++) OSSafeReleaseNULL(nvCfgMap[i]);   // gNvCfg cleared above (under the lock)
 	OSSafeReleaseNULL(lps0);
 	OSSafeReleaseNULL(ipNames);
 	OSSafeReleaseNULL(ipIgnore);
@@ -1257,6 +1290,15 @@ IOReturn S0ixStandby::callPlatformFunction(const OSSymbol *functionName, bool wa
 				for (uint32_t i = 0; i < (gatingBytes + 3) / 4; i++) gatingAtHalt[i] = gatingPtr[i];
 				gatingValid = true;
 			}
+			if (lastSleepType == kSleepTypeDeepIdle) {
+				bool any = false;
+				for (uint32_t s = 0; s < kNvCfgSlots; s++)          // root ports only (bus 0): no config cycle reaches a link
+					if (gNvCfg[s] && (gNvCfgBdf[s] >> 8) == 0) {
+						for (uint32_t i = 0; i < 1024; i++) gNvCfgSnap[1][s][i] = gNvCfg[s][i];
+						any = true;
+					}
+				gNvCfgHaltValid = any; gNvCfgActiveValid = false;
+			}
 			return kIOReturnSuccess;
 		}
 		if (functionName->isEqualTo("IOPlatformActiveAction")) {
@@ -1310,6 +1352,15 @@ IOReturn S0ixStandby::callPlatformFunction(const OSSymbol *functionName, bool wa
 					if (kbRteUnmasked && ioapic) { ioapic[0] = 0x12; ioapic[4] = kbRteLow; kbRteUnmasked = false; }
 					if (kbArmResult == 1 && (kbStsAtWake & 0x21) == 0x01) kbWoke = true;   // keyboard byte waiting
 				}
+			}
+			if (gNvCfgHaltValid && !gNvCfgActiveValid) {
+				for (uint32_t s = 0; s < kNvCfgSlots; s++)          // root ports first, then the drives
+					if (gNvCfg[s] && (gNvCfgBdf[s] >> 8) == 0)
+						for (uint32_t i = 0; i < 1024; i++) gNvCfgSnap[2][s][i] = gNvCfg[s][i];
+				for (uint32_t s = 0; s < kNvCfgSlots; s++)
+					if (gNvCfg[s] && (gNvCfgBdf[s] >> 8) != 0)
+						for (uint32_t i = 0; i < 1024; i++) gNvCfgSnap[2][s][i] = gNvCfg[s][i];
+				gNvCfgActiveValid = true; gNvCfgSleeps++;
 			}
 			if (pmcDump && counterPage && pmcHaltValid) {
 				for (uint32_t i = 0; i < 1024; i++) pmcAtActive[i] = counterPage[i];
@@ -1608,6 +1659,46 @@ void S0ixStandby::iomLater(thread_call_param_t self, thread_call_param_t)
 // told the display is off (DPOF or DC9). Only with nothing attached to USB-C (never sleep docked).
 // Called from the 60 s timer (normal thread context, system awake): find the devices and, for -s0ixnvmeps, allocate the
 // admin-queue DMA buffers and map BAR0 now - not in the sleep action.
+// ECAM base from the host bridge's PCIEXBAR (00:00.0 0x60, bit 0 enable, bits 3:1 length: 0 = 256 MB, 1 = 128 MB,
+// 2 = 64 MB, 3 = 512 MB, 4 = 1 GB, 5 = 2 GB, 6 = 4 GB). Each mapping is checked against IOPCIFamily's vendor/device read.
+void S0ixStandby::nvCfgMapAll()
+{
+	nvCfgTried = true;
+	OSDictionary *match = serviceMatching("IOPCIDevice");
+	OSIterator *it = match ? getMatchingServices(match) : nullptr;
+	OSSafeReleaseNULL(match);
+	uint64_t bar = 0;
+	while (it && !bar)
+		if (IOPCIDevice *d = OSDynamicCast(IOPCIDevice, it->getNextObject())) {
+			if (d->getBusNumber() == 0 && d->getDeviceNumber() == 0 && d->getFunctionNumber() == 0)
+				bar = ((uint64_t)d->configRead32(0x64) << 32) | d->configRead32(0x60);
+		} else break;
+	OSSafeReleaseNULL(it);
+	char buf[200];
+	if (!(bar & 1)) { snprintf(buf, sizeof(buf), "PCIEXBAR 0x%llx not enabled", (unsigned long long)bar); setProperty("NVMe config snapshot", buf); return; }
+	static const uint64_t kLen[8] = {256, 128, 64, 512, 1024, 2048, 4096, 256};
+	uint64_t base = bar & ~((kLen[(bar >> 1) & 7] << 20) - 1) & 0x3FFFFFFFFFFULL;
+	size_t k = 0;
+	snAdd(buf, sizeof(buf), k, "ECAM 0x%llx:", (unsigned long long)base);
+	for (uint32_t i = 0; i < nvN && i < kNvCfgSlots; i++) {
+		IOPCIDevice *d = nvDev[i];
+		uint64_t a = base + ((uint64_t)d->getBusNumber() << 20) + ((uint64_t)d->getDeviceNumber() << 15) + ((uint64_t)d->getFunctionNumber() << 12);
+		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(a, 0x1000, kIODirectionIn);
+		IOMemoryMap *m = md ? md->map(kIOMapInhibitCache | kIOMapReadOnly) : nullptr;
+		OSSafeReleaseNULL(md);
+		volatile uint32_t *p = m ? reinterpret_cast<volatile uint32_t *>(m->getVirtualAddress()) : nullptr;
+		bool ok = p && p[0] == d->configRead32(kIOPCIConfigVendorID) && p[0] != 0xFFFFFFFF;
+		snAdd(buf, sizeof(buf), k, " %02x:%02x.%x %s", d->getBusNumber(), d->getDeviceNumber(), d->getFunctionNumber(), ok ? "ok" : "MISMATCH");
+		if (!ok) { OSSafeReleaseNULL(m); continue; }
+		nvCfgMap[i] = m;
+		uint32_t bdf = ((uint32_t)d->getBusNumber() << 8) | ((uint32_t)d->getDeviceNumber() << 3) | d->getFunctionNumber();
+		if (gCoreSnapLock) IOLockLock(gCoreSnapLock);
+		gNvCfgBdf[i] = bdf; gNvCfg[i] = p;
+		if (gCoreSnapLock) IOLockUnlock(gCoreSnapLock);
+	}
+	setProperty("NVMe config snapshot", buf);
+}
+
 void S0ixStandby::nvmePrep()
 {
 	if (!nvN) {   // root ports 00:06.x first (parents), then the NVMe endpoints (class 01:08:02)
@@ -1634,6 +1725,7 @@ void S0ixStandby::nvmePrep()
 			o = 0; if (nvDev[i]->extendedFindPCICapability(kIOPCIExpressCapabilityIDLatencyTolerenceReporting, &o)) nvLtr[i] = (uint16_t)o;
 		}
 	}
+	if (prepAlloc && !nvCfgTried) nvCfgMapAll();
 	if (!prepAlloc) return;
 	for (uint32_t i = 0; i < nvN; i++) {
 		if ((nvDev[i]->configRead32(kIOPCIConfigRevisionID) >> 8) != 0x010802) continue;

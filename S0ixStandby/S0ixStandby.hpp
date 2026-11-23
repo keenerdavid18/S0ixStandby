@@ -379,6 +379,11 @@ private:
 	char nvPsInfo[kNvMax][140] {};
 	bool nvmeCtrlPs(uint32_t i);
 	void nvmePrep();
+	// Full 4 KB config space of the root ports + drives through ECAM (PCIEXBAR), so the quiesce action can read the
+	// root ports' link state (LNKSTA, Intel LTSSM/power-gating registers) right before the halt without IOPCIFamily locks.
+	IOMemoryMap *nvCfgMap[kNvMax] {};
+	bool nvCfgTried {false};
+	void nvCfgMapAll();
 	bool prepAlloc {true};
 	uint32_t nvMode {0};
 	uint8_t nvMsix[kNvMax] {};
