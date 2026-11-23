@@ -1630,10 +1630,7 @@ void S0ixStandby::iomLater(thread_call_param_t self, thread_call_param_t)
 			snAdd(t, sizeof(t), n, " %02x:%02x.%x D%u%s", me->nvDev[i]->getBusNumber(), me->nvDev[i]->getDeviceNumber(),
 			              me->nvDev[i]->getFunctionNumber(), me->nvSaved[i] & 3, me->nvChanged[i] ? (me->nvAfter[i] & 3) == 0 ? "->D0" : "->D0 FAILED" : "");
 		me->setProperty("NVMe at last sleep", t);
-		char sk[120];
-		snprintf(sk, sizeof(sk), "0x%x%s%s%s%s", me->lastSkip, me->lastSkip & 1 ? " LPS0-DSM" : "", me->lastSkip & 2 ? " TCSS-D3cold" : "",
-		         me->lastSkip & 4 ? " refclk" : "", me->lastSkip & 8 ? " wake-arming" : "");
-		me->setProperty("Skipped at last sleep", sk);
+
 		char l[600]; size_t m = 0;
 		for (uint32_t i = 0; i < me->nvN && m < sizeof(l) - 120; i++)
 			snAdd(l, sizeof(l), m, "%s%02x:%02x.%x lnkctl %x/%x/%x devctl2 %x/%x/%x l1ss %x/%x/%x ltr %x/%x/%x", m ? "; " : "",
@@ -2719,6 +2716,12 @@ void S0ixStandby::publish()
 	absolutetime_to_nanoseconds(snap.timeAtWake - snap.timeAtSleep, &ns);
 
 	setProperty("Sleep count", (unsigned long long)snap.sleepCount, 32);
+	{   // here, not in iomLater: that one only runs after a DSM exit, so a skip-0x1 sleep left the old value
+		char sk[120];
+		snprintf(sk, sizeof(sk), "0x%x%s%s%s%s", lastSkip, lastSkip & 1 ? " LPS0-DSM" : "", lastSkip & 2 ? " TCSS-D3cold" : "",
+		         lastSkip & 4 ? " refclk" : "", lastSkip & 8 ? " wake-arming" : "");
+		setProperty("Skipped at last sleep", sk);
+	}
 	if (acNoRtc && pm1EnPort) {
 		setProperty("AC RTC wake blocks", (unsigned long long)rtcBlockCount, 32);
 		setProperty("On AC (last check)", onAC);
