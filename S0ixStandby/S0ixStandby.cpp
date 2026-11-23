@@ -342,7 +342,8 @@ static int nvCfgHandler(struct sysctl_oid *, void *, int, struct sysctl_req *req
 // NVMe handling for the next Deep Idle, switchable at runtime: sudo sysctl debug.s0ix.nvme=<v>
 //   v & 0xF: 0 = macOS default (drives in D3), 1 = D0 with the controller left shut down, 2 = D0 + live controller in
 //   its deepest PS (I/O queue pair); 0x10 = mask MSI-X (function mask) during the halt (mode 2);
-//   0x100 / 0x200 = live PS only for the drive on bus 4 / bus 5 (the other stays D0 shut down; neither = both).
+//   0x100 / 0x200 = live PS only for the drive on bus 4 / bus 5 (the other stays D0 shut down; neither = both);
+//   0x400 / 0x800 = leave the drive on bus 4 / bus 5 in macOS's D3 (its link idles there), the other per the mode.
 //   Default from -s0ixnvmed0 / -s0ixnvmeps.
 static int gNvmeCtl = 0;
 SYSCTL_DECL(_debug);
@@ -352,7 +353,7 @@ SYSCTL_PROC(_debug_s0ix, OID_AUTO, cores, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, pmc, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
             pmcPageHandler, "S", "live PMC page (the LPIT counter's 4 KB MMIO page)");
 SYSCTL_INT(_debug_s0ix, OID_AUTO, nvme, CTLFLAG_RW | CTLFLAG_LOCKED, &gNvmeCtl, 0,
-           "NVMe Deep Idle mode: 0 D3 (macOS), 1 D0 shut down, 2 D0 live PS; +0x10 MSI-X masked; +0x100 bus 4 / +0x200 bus 5 only");
+           "NVMe Deep Idle mode: 0 D3 (macOS), 1 D0 shut down, 2 D0 live PS; +0x10 MSI-X masked; +0x100 bus 4 / +0x200 bus 5 only; +0x400 bus 4 / +0x800 bus 5 stay D3");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, disp, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
             dispHandler, "S", "live display registers");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, disphalt, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, (void *)1, 0,
@@ -1767,7 +1768,8 @@ void S0ixStandby::nvmeSleep()
 		const bool isEp = (d->configRead32(kIOPCIConfigRevisionID) >> 8) == 0x010802;
 		const uint32_t sel = nvMode & 0x300, bus = d->getBusNumber();
 		const bool picked = !isEp || !sel || (bus == 4 && (sel & 0x100)) || (bus == 5 && (sel & 0x200));
-		if ((nvMode & 0xF) >= 1 && nvPm[i] && (nvSaved[i] & 3) && nvSaved[i] != 0xFFFF) {   // D0: every drive
+		const bool keepD3 = isEp && ((bus == 4 && (nvMode & 0x400)) || (bus == 5 && (nvMode & 0x800)));
+		if ((nvMode & 0xF) >= 1 && !keepD3 && nvPm[i] && (nvSaved[i] & 3) && nvSaved[i] != 0xFFFF) {   // D0: every drive but keepD3
 			d->configWrite16(nvPm[i] + 4, (uint16_t)(nvSaved[i] & ~3));
 			IODelay(10000);                                   // D3hot -> D0: 10 ms
 			nvAfter[i] = d->configRead16(nvPm[i] + 4);
