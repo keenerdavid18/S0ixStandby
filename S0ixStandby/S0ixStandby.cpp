@@ -346,6 +346,9 @@ static int nvCfgHandler(struct sysctl_oid *, void *, int, struct sysctl_req *req
 //   0x400 / 0x800 = leave the drive on bus 4 / bus 5 in macOS's D3 (its link idles there), the other per the mode.
 //   Default from -s0ixnvmed0 / -s0ixnvmeps.
 static int gNvmeCtl = 0;
+// Skip sleep-only steps for the next Deep Idle (subtraction test: which step costs PC6 vs awake idle):
+//   0x1 LPS0 _DSM entry/exit, 0x2 TCSS D3cold, 0x4 display refclk workaround, 0x8 wake arming (kbd, power button, lid pad).
+static int gSkip = 0;
 SYSCTL_DECL(_debug);
 SYSCTL_NODE(_debug, OID_AUTO, s0ix, CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, "S0ixStandby");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, cores, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
@@ -354,6 +357,8 @@ SYSCTL_PROC(_debug_s0ix, OID_AUTO, pmc, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LO
             pmcPageHandler, "S", "live PMC page (the LPIT counter's 4 KB MMIO page)");
 SYSCTL_INT(_debug_s0ix, OID_AUTO, nvme, CTLFLAG_RW | CTLFLAG_LOCKED, &gNvmeCtl, 0,
            "NVMe Deep Idle mode: 0 D3 (macOS), 1 D0 shut down, 2 D0 live PS; +0x10 MSI-X masked; +0x100 bus 4 / +0x200 bus 5 only; +0x400 bus 4 / +0x800 bus 5 stay D3");
+SYSCTL_INT(_debug_s0ix, OID_AUTO, skip, CTLFLAG_RW | CTLFLAG_LOCKED, &gSkip, 0,
+           "skip for the next Deep Idle: 0x1 LPS0 DSM, 0x2 TCSS D3cold, 0x4 refclk WA, 0x8 wake arming");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, disp, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0,
             dispHandler, "S", "live display registers");
 SYSCTL_PROC(_debug_s0ix, OID_AUTO, disphalt, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, (void *)1, 0,
@@ -635,6 +640,7 @@ bool S0ixStandby::start(IOService *provider)
 		sysctl_register_oid(&sysctl__debug_s0ix_cores);
 		sysctl_register_oid(&sysctl__debug_s0ix_pmc);
 		sysctl_register_oid(&sysctl__debug_s0ix_nvme);
+		sysctl_register_oid(&sysctl__debug_s0ix_skip);
 		sysctl_register_oid(&sysctl__debug_s0ix_disp);
 		sysctl_register_oid(&sysctl__debug_s0ix_disphalt);
 		sysctl_register_oid(&sysctl__debug_s0ix_nvcfg);
@@ -655,6 +661,7 @@ void S0ixStandby::stop(IOService *provider)
 		sysctl_unregister_oid(&sysctl__debug_s0ix_nvcfg);
 		sysctl_unregister_oid(&sysctl__debug_s0ix_disphalt);
 		sysctl_unregister_oid(&sysctl__debug_s0ix_disp);
+		sysctl_unregister_oid(&sysctl__debug_s0ix_skip);
 		sysctl_unregister_oid(&sysctl__debug_s0ix_nvme);
 		sysctl_unregister_oid(&sysctl__debug_s0ix_pmc);
 		sysctl_unregister_oid(&sysctl__debug_s0ix_cores);
@@ -1623,6 +1630,10 @@ void S0ixStandby::iomLater(thread_call_param_t self, thread_call_param_t)
 			snAdd(t, sizeof(t), n, " %02x:%02x.%x D%u%s", me->nvDev[i]->getBusNumber(), me->nvDev[i]->getDeviceNumber(),
 			              me->nvDev[i]->getFunctionNumber(), me->nvSaved[i] & 3, me->nvChanged[i] ? (me->nvAfter[i] & 3) == 0 ? "->D0" : "->D0 FAILED" : "");
 		me->setProperty("NVMe at last sleep", t);
+		char sk[120];
+		snprintf(sk, sizeof(sk), "0x%x%s%s%s%s", me->lastSkip, me->lastSkip & 1 ? " LPS0-DSM" : "", me->lastSkip & 2 ? " TCSS-D3cold" : "",
+		         me->lastSkip & 4 ? " refclk" : "", me->lastSkip & 8 ? " wake-arming" : "");
+		me->setProperty("Skipped at last sleep", sk);
 		char l[600]; size_t m = 0;
 		for (uint32_t i = 0; i < me->nvN && m < sizeof(l) - 120; i++)
 			snAdd(l, sizeof(l), m, "%s%02x:%02x.%x lnkctl %x/%x/%x devctl2 %x/%x/%x l1ss %x/%x/%x ltr %x/%x/%x", m ? "; " : "",
@@ -2404,6 +2415,7 @@ void S0ixStandby::battTimerFired(OSObject *owner, IOTimerEventSource *sender)
 
 void S0ixStandby::onSleep()
 {
+	skipNow = lastSkip = (uint32_t)gSkip;
 	lastSleepType = 0;
 	if (IOPMrootDomain *root = getPMRootDomain())
 		if (OSNumber *n = OSDynamicCast(OSNumber, root->getProperty("IOPMSystemSleepType")))
@@ -2421,18 +2433,18 @@ void S0ixStandby::onSleep()
 		dispCapture(dispAtSleep, nullptr);
 		gDispMMIO = gpuMMIO;
 		gDispOk = dispAtSleep.valid;
-		if (refclkWA) refclkSleep();
+		if (refclkWA && !(skipNow & 4)) refclkSleep();
 	}
 	// Drivers (and IOPCIFamily's D3 transition) are done by now.
 	wifiPmcsrSleep = wifiDev ? wifiDev->configRead16(wifiPmCap + 4) : 0xFFFF;
 
 	if (acNoEc && acNoEcActive && lastSleepType == kSleepTypeDeepIdle) acNoEcCount++;
-	if (lwWake && lastSleepType == kSleepTypeDeepIdle) lidPsw(true);   // while the EC still answers normally
-	if (tcssD3 && lastSleepType == kSleepTypeDeepIdle) tcssSleep();   // before the LPS0 entry _DSM, like Linux
+	if (lwWake && !(skipNow & 8) && lastSleepType == kSleepTypeDeepIdle) lidPsw(true);   // while the EC still answers normally
+	if (tcssD3 && !(skipNow & 2) && lastSleepType == kSleepTypeDeepIdle) tcssSleep();   // before the LPS0 entry _DSM, like Linux
 	if (nobmMask && lastSleepType == kSleepTypeDeepIdle) nobmSleep();
 	if (lastSleepType == kSleepTypeDeepIdle) nvmeSleep();
 	entered = false;
-	if (dsmEnabled && lastSleepType == kSleepTypeDeepIdle &&
+	if (dsmEnabled && !(skipNow & 1) && lastSleepType == kSleepTypeDeepIdle &&
 	    (dsmMask[kIntel] || dsmMask[kMicrosoft] || dsmMask[kAMD])) {
 		if (iomReg) iomV[0] = *iomReg;
 		dsmEntry();
@@ -2456,11 +2468,11 @@ void S0ixStandby::onSleep()
 		rtcBlocked = true;
 	}
 	ecArm = ecWake && gpe0EnPort && ecGpe != 0xFFFFFFFF && lastSleepType == kSleepTypeDeepIdle;
-	pbArm = pbWake && pbEnPort && pm1StsPort && gpe0StsPort && lastSleepType == kSleepTypeDeepIdle;
-	lwArm = lwWake && (lwDev[0] || lwDev[1]) && lastSleepType == kSleepTypeDeepIdle;
+	pbArm = pbWake && !(skipNow & 8) && pbEnPort && pm1StsPort && gpe0StsPort && lastSleepType == kSleepTypeDeepIdle;
+	lwArm = lwWake && !(skipNow & 8) && (lwDev[0] || lwDev[1]) && lastSleepType == kSleepTypeDeepIdle;
 	lwWoke = false;
 	kbArm = false; kbWoke = false; kbArmResult = 0; kbStsAtWake = 0;
-	if (kbWake && lastSleepType == kSleepTypeDeepIdle) {
+	if (kbWake && !(skipNow & 8) && lastSleepType == kSleepTypeDeepIdle) {
 		UInt32 open = 1;                                   // no lid device: treat as open
 		if (lwDev[0] && lwDev[0]->evaluateInteger("_LID", &open) != kIOReturnSuccess) open = 1;
 		kbArm = open != 0;
@@ -2616,7 +2628,8 @@ void S0ixStandby::onWake()
 	nobmWake();
 	tcssWake();
 	if (elPending && elCall) { uint64_t dl; clock_interval_to_deadline(200, kMillisecondScale, &dl); thread_call_enter_delayed(elCall, dl); }
-	if (lwWake && lastSleepType == kSleepTypeDeepIdle) lidPsw(false);
+	if (lwWake && !(skipNow & 8) && lastSleepType == kSleepTypeDeepIdle) lidPsw(false);
+	skipNow = 0;
 	// Before any driver wakes: Apple's accelerator restarts the engines later.
 	if (gpuMMIO) {
 		dispCapture(dispAtWake, &dispAtSleep);

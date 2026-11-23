@@ -383,6 +383,7 @@ private:
 	// root ports' link state (LNKSTA, Intel LTSSM/power-gating registers) right before the halt without IOPCIFamily locks.
 	IOMemoryMap *nvCfgMap[kNvMax] {};
 	bool nvCfgTried {false};
+	uint32_t skipNow {0}, lastSkip {0};                // debug.s0ix.skip latched at the sleep action
 	void nvCfgMapAll();
 	bool prepAlloc {true};
 	uint32_t nvMode {0};
