@@ -14,6 +14,28 @@
 
 #include <IOKit/IOService.h>
 #include <kern/thread_call.h>
+#include <stdarg.h>
+#include <libkern/libkern.h>
+
+// snAdd: append to a fixed buffer and keep the running length inside it. snprintf returns the length it WOULD have
+// written, so "n += snprintf(buf + n, size - n, ...)" runs n past the end and "size - n" wraps around (stack overflow;
+// seen as a ___stack_chk_fail panic in publishTypeC when a dark wake read 0xFFFFFFFF from the Type-C xHCI).
+template <typename T>
+static inline void snAdd(char *buf, size_t size, T &n, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+template <typename T>
+static inline void snAdd(char *buf, size_t size, T &n, const char *fmt, ...)
+{
+	if (!buf || size == 0) return;
+	size_t cur = (long long)n < 0 ? 0 : (size_t)n;
+	if (cur >= size - 1) { n = (T)(size - 1); return; }
+	va_list ap;
+	va_start(ap, fmt);
+	int w = vsnprintf(buf + cur, size - cur, fmt, ap);
+	va_end(ap);
+	if (w > 0) cur += (size_t)w;
+	if (cur > size - 1) cur = size - 1;
+	n = (T)cur;
+}
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOMemoryDescriptor.h>

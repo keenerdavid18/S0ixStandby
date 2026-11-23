@@ -410,7 +410,7 @@ void S0ixStandby::gpuFormat(const GpuState &s, char *out, size_t size)
 	size_t n = snprintf(out, size, "D%u cmd=%x pmcsr=%x bar0=%x:%x%s", s.pmcsr & 3, s.cmd, s.pmcsr,
 	                    s.bar1, s.bar0, s.decodeEnabled ? " (decode was off, enabled for the read)" : "");
 	for (uint32_t i = 0; i < kGpuRegCount && n < size; i++)
-		n += snprintf(out + n, size - n, " %s=%x", kGpuRegs[i].name, s.reg[i]);
+		snAdd(out, size, n, " %s=%x", kGpuRegs[i].name, s.reg[i]);
 	if (s.canary && n < size) snprintf(out + n, size - n, " (canary written)");
 }
 

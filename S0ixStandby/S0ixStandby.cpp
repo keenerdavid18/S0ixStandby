@@ -970,7 +970,7 @@ OSArray *S0ixStandby::blockerNames(const uint8_t *b, char *line, size_t lineSize
 			continue;
 		if (blockers) blockers->setObject(name);
 		if (n < lineSize)
-			n += snprintf(line + n, lineSize - n, " %s", name->getCStringNoCopy());
+			snAdd(line, lineSize, n, " %s", name->getCStringNoCopy());
 	}
 	return blockers;
 }
@@ -1011,7 +1011,7 @@ void S0ixStandby::publishBlockers()
 	}
 	char raw[80]; size_t r = 0; raw[0] = 0;
 	for (uint32_t i = 0; i < gatingBytes && r < sizeof(raw); i++)
-		r += snprintf(raw + r, sizeof(raw) - r, "%02x", b[i]);
+		snAdd(raw, sizeof(raw), r, "%02x", b[i]);
 	setProperty("Last gating status at halt", raw);
 	LOG("IPs still powered at the Deep Idle halt (likely S0ix blockers):%s", n ? line : " none");
 }
@@ -1473,17 +1473,19 @@ void S0ixStandby::publishTypeC()
 			uint8_t pm = 0;
 			uint32_t ps = 0xFF;
 			if (d->findPCICapability(kIOPCIPowerManagementCapability, &pm) && pm) ps = d->configRead16(pm + 4) & 3;
-			n += snprintf(pci + n, sizeof(pci) - n, "%s%x.%x D%u", n ? ", " : "", w[0], w[1], ps);
+			snAdd(pci, sizeof(pci), n, "%s%x.%x D%u", n ? ", " : "", w[0], w[1], ps);
 			if (w[0] == 0x0d && w[1] == 0) {
 				if (!txhcDev) { d->retain(); txhcDev = d; txhcPm = pm; }
 				if (!txhcMap) txhcMap = d->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0, kIOMapInhibitCache);
 				if (txhcMap && ps == 0) {
 					volatile uint8_t *b = reinterpret_cast<volatile uint8_t *>(txhcMap->getVirtualAddress());
-					uint32_t capLen = b[0], maxPorts = (*reinterpret_cast<volatile uint32_t *>(b + 4)) >> 24;
+					uint32_t hcs1 = *reinterpret_cast<volatile uint32_t *>(b + 4), capLen = b[0], maxPorts = hcs1 >> 24;
+					// a dark wake can read the controller as all ones (not back yet): no garbage port dump
+					if (hcs1 == 0xFFFFFFFF || capLen < 0x10 || capLen == 0xFF) { snprintf(ports, sizeof(ports), "controller not readable"); maxPorts = 0; }
 					for (uint32_t p = 0; p < maxPorts && p < 16; p++) {
 						uint32_t sc = *reinterpret_cast<volatile uint32_t *>(b + capLen + 0x400 + 0x10 * p);
 						// CCS b0, PED b1, PR b4, PLS b8:5, PP b9, speed b13:10
-						pn += snprintf(ports + pn, sizeof(ports) - pn, "%sP%u %08x(ccs%u ped%u pls%u pp%u spd%u)", pn ? " " : "",
+						snAdd(ports, sizeof(ports), pn, "%sP%u %08x(ccs%u ped%u pls%u pp%u spd%u)", pn ? " " : "",
 						               p + 1, sc, sc & 1, (sc >> 1) & 1, (sc >> 5) & 0xF, (sc >> 9) & 1, (sc >> 10) & 0xF);
 					}
 				} else if (ps != 0) {
@@ -1564,14 +1566,14 @@ void S0ixStandby::iomLater(thread_call_param_t self, thread_call_param_t)
 	}
 	if (me->nvN) {
 		char t[300]; size_t n = 0;
-		n += snprintf(t + n, sizeof(t) - n, "mode 0x%x (%s), %u sleeps:", me->nvMode, (me->nvMode & 0xF) == 2 ? "D0 live PS" : (me->nvMode & 0xF) == 1 ? "D0 shut down" : "macOS D3", me->nvCount);
+		snAdd(t, sizeof(t), n, "mode 0x%x (%s), %u sleeps:", me->nvMode, (me->nvMode & 0xF) == 2 ? "D0 live PS" : (me->nvMode & 0xF) == 1 ? "D0 shut down" : "macOS D3", me->nvCount);
 		for (uint32_t i = 0; i < me->nvN && n < sizeof(t) - 40; i++)
-			n += snprintf(t + n, sizeof(t) - n, " %02x:%02x.%x D%u%s", me->nvDev[i]->getBusNumber(), me->nvDev[i]->getDeviceNumber(),
+			snAdd(t, sizeof(t), n, " %02x:%02x.%x D%u%s", me->nvDev[i]->getBusNumber(), me->nvDev[i]->getDeviceNumber(),
 			              me->nvDev[i]->getFunctionNumber(), me->nvSaved[i] & 3, me->nvChanged[i] ? (me->nvAfter[i] & 3) == 0 ? "->D0" : "->D0 FAILED" : "");
 		me->setProperty("NVMe at last sleep", t);
 		char l[600]; size_t m = 0;
 		for (uint32_t i = 0; i < me->nvN && m < sizeof(l) - 120; i++)
-			m += snprintf(l + m, sizeof(l) - m, "%s%02x:%02x.%x lnkctl %x/%x/%x devctl2 %x/%x/%x l1ss %x/%x/%x ltr %x/%x/%x", m ? "; " : "",
+			snAdd(l, sizeof(l), m, "%s%02x:%02x.%x lnkctl %x/%x/%x devctl2 %x/%x/%x l1ss %x/%x/%x ltr %x/%x/%x", m ? "; " : "",
 			              me->nvDev[i]->getBusNumber(), me->nvDev[i]->getDeviceNumber(), me->nvDev[i]->getFunctionNumber(),
 			              me->nvLnk[i][0], me->nvLnk[i][1], me->nvLnk[i][2], me->nvDc2[i][0], me->nvDc2[i][1], me->nvDc2[i][2],
 			              me->nvSs1[i][0], me->nvSs1[i][1], me->nvSs1[i][2], me->nvLtrV[i][0], me->nvLtrV[i][1], me->nvLtrV[i][2]);
@@ -1579,7 +1581,7 @@ void S0ixStandby::iomLater(thread_call_param_t self, thread_call_param_t)
 		if ((me->nvMode & 0xF) == 2) {
 			char q[400]; size_t k = 0;
 			for (uint32_t i = 0; i < me->nvN && k < sizeof(q) - 100; i++)
-				if (me->nvPsInfo[i][0]) k += snprintf(q + k, sizeof(q) - k, "%s%02x:00.0 %s", k ? "; " : "", me->nvDev[i]->getBusNumber(), me->nvPsInfo[i]);
+				if (me->nvPsInfo[i][0]) snAdd(q, sizeof(q), k, "%s%02x:00.0 %s", k ? "; " : "", me->nvDev[i]->getBusNumber(), me->nvPsInfo[i]);
 			me->setProperty("NVMe power state at last sleep", k ? q : "not attempted");
 		}
 	}
@@ -2136,13 +2138,13 @@ void S0ixStandby::publishWakeInfo()
 	}
 	char buf[192];
 	int n = snprintf(buf, sizeof(buf), "%s", "");
-	if (pm1StsAtWake & (1u << 8))  n += snprintf(buf + n, sizeof(buf) - (size_t)n, "%sPWRBTN", n ? ", " : "");
-	if (pm1StsAtWake & (1u << 10)) n += snprintf(buf + n, sizeof(buf) - (size_t)n, "%sRTC", n ? ", " : "");
+	if (pm1StsAtWake & (1u << 8))  snAdd(buf, sizeof(buf), n, "%sPWRBTN", n ? ", " : "");
+	if (pm1StsAtWake & (1u << 10)) snAdd(buf, sizeof(buf), n, "%sRTC", n ? ", " : "");
 	for (uint32_t i = 0; i < gpe0Half && i < sizeof(gpe0StsAtWake) && n < (int)sizeof(buf) - 24; i++)
 		for (uint32_t b = 0; b < 8; b++)
 			if (gpe0StsAtWake[i] & (1u << b)) {
 				uint32_t g = i * 8 + b;
-				n += snprintf(buf + n, sizeof(buf) - (size_t)n, "%sGPE 0x%x%s", n ? ", " : "", g,
+				snAdd(buf, sizeof(buf), n, "%sGPE 0x%x%s", n ? ", " : "", g,
 				              g == ecGpe ? " (EC)" : "");
 			}
 	if (!n) snprintf(buf, sizeof(buf), "none latched (PM1_STS 0x%04x)", pm1StsAtWake);
@@ -2150,7 +2152,7 @@ void S0ixStandby::publishWakeInfo()
 	{
 		char en[2 * sizeof(gpe0EnAtHalt) + 1]; size_t k = 0;
 		for (uint32_t i = 0; i < gpe0Half && i < sizeof(gpe0EnAtHalt); i++)
-			k += snprintf(en + k, sizeof(en) - k, "%02x", gpe0EnAtHalt[i]);
+			snAdd(en, sizeof(en), k, "%02x", gpe0EnAtHalt[i]);
 		setProperty("GPE0_EN at last halt (byte 0 first)", en);
 		char rb[140];
 		if (lwPad) {
@@ -2391,7 +2393,7 @@ void S0ixStandby::elReplay(thread_call_param_t self, thread_call_param_t)
 	char line[112]; int k = snprintf(line, sizeof(line), "#%u %02lu:%02lu:%02lu UTC: %s%s%s EC status 0x%02x, queries:", ++me->elSeq,
 		(unsigned long)((sec / 3600) % 24), (unsigned long)((sec / 60) % 60), (unsigned long)(sec % 60),
 		me->elEc ? "EC GPE" : "not EC", (me->elPm1 & kPm1PwrBtn) ? " +PWRBTN" : "", (me->elPm1 & (1u << 10)) ? " +RTC" : "", me->elSci);
-	for (uint8_t i = 0; i < n && k < (int)sizeof(line) - 5; i++) k += snprintf(line + k, sizeof(line) - (size_t)k, " %02X", q[i]);
+	for (uint8_t i = 0; i < n && k < (int)sizeof(line) - 5; i++) snAdd(line, sizeof(line), k, " %02X", q[i]);
 	if (!n && k < (int)sizeof(line) - 6) snprintf(line + k, sizeof(line) - (size_t)k, " none");
 	const uint32_t slot = (me->elSeq - 1) % 24;
 	snprintf(me->elLines[slot], sizeof(me->elLines[slot]), "%s", line);
@@ -2459,7 +2461,7 @@ void S0ixStandby::onWake()
 	if (edWake && lastSleepType == kSleepTypeDeepIdle) {
 		char ed[300]; int n = snprintf(ed, sizeof(ed), "EC status at halt 0x%02x (GPE sts %d), drained %u:", ecStsAtHalt,
 		                               (int)edGpeStsAtHalt, edN);
-		for (uint8_t i = 0; i < edN && n < (int)sizeof(ed) - 6; i++) n += snprintf(ed + n, sizeof(ed) - (size_t)n, " _Q%02X", edQ[i]);
+		for (uint8_t i = 0; i < edN && n < (int)sizeof(ed) - 6; i++) snAdd(ed, sizeof(ed), n, " _Q%02X", edQ[i]);
 		snprintf(ed + n, sizeof(ed) - (size_t)n, "; EC status at wake 0x%02x, EC GPE dword at wake 0x%08x; PM1_CNT 0x%04x; SCI RTE 0x%08x:%08x%s",
 		         ecStsAtWakeP, ecEnAtWake, pm1CntAtHalt, sciRteHigh, sciRteLow, ioapic ? "" : " (no IOAPIC map)");
 		setProperty("EC drain at last sleep", ed);
@@ -2642,7 +2644,7 @@ void S0ixStandby::publish()
 					num->release();
 				}
 				if (n < sizeof(line))
-					n += snprintf(line + n, sizeof(line) - n, " %s=%llu%%", kCStates[i].name, (unsigned long long)pct);
+					snAdd(line, sizeof(line), n, " %s=%llu%%", kCStates[i].name, (unsigned long long)pct);
 			}
 			setProperty("Last C-state percent", d);
 			d->release();
